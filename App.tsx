@@ -846,7 +846,7 @@ const App: React.FC = () => {
        {appMode === 'GAME' && gameState.phase !== Phase.ROLE_REVEAL && (
            <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto" ref={scrollRef}>
                {gameState.storyLog.map((log, idx) => (
-                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono">> {log}</p>
+                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono"> {log}</p>
                ))}
            </div>
        )}
