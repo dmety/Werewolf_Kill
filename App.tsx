@@ -42,6 +42,9 @@ const App: React.FC = () => {
   
   // --- Game State ---
   const [gameState, setGameState] = useState<GameState>(createInitialState());
+  // Ref to hold latest state for Async/Timer operations to prevent stale closures overwriting state
+  const gameStateRef = useRef<GameState>(gameState);
+
   const [myPlayerId, setMyPlayerId] = useState<number | null>(null);
   const [isHost, setIsHost] = useState(false);
   
@@ -60,6 +63,11 @@ const App: React.FC = () => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const publicChatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Sync Ref with State
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -98,22 +106,25 @@ const App: React.FC = () => {
   // --- Timer System (Host Only) ---
   useEffect(() => {
     if (!isHost) return;
-    // Timer only active during Night Steps (not NONE) or Voting?
-    // User asked for "Night action roles have 20s limit".
-    const isActionPhase = gameState.phase === Phase.NIGHT && gameState.nightStep !== NightStep.NONE;
     
+    const isActionPhase = gameState.phase === Phase.NIGHT && gameState.nightStep !== NightStep.NONE;
     if (!isActionPhase) return;
     if (gameState.timeLeft <= 0) return;
 
     const timer = setTimeout(() => {
-        const newTime = gameState.timeLeft - 1;
+        // CRITICAL: Use ref to get the absolute latest state, including any user actions that happened in the last second
+        const current = gameStateRef.current;
+        
+        // Double check phase in case it changed mid-tick
+        if (current.phase !== Phase.NIGHT || current.timeLeft <= 0) return;
+
+        const newTime = current.timeLeft - 1;
+        
         if (newTime <= 0) {
             handleTimerExpire();
         } else {
-            // Update time locally and broadcast. 
-            // Note: Broadcasting every second might be heavy, but necessary for countdown sync.
-            // Optimized: We could just update local state and let clients predict, but broadcasting is safer for logic.
-            updateAndBroadcast({ ...gameState, timeLeft: newTime });
+            // Update time while preserving other recent changes
+            updateAndBroadcast({ ...current, timeLeft: newTime });
         }
     }, 1000);
 
@@ -121,14 +132,15 @@ const App: React.FC = () => {
   }, [gameState.timeLeft, gameState.phase, gameState.nightStep, isHost]);
 
   const handleTimerExpire = () => {
-      // Auto-advance logic based on current step
-      if (gameState.nightStep === NightStep.WEREWOLF_ACTION) confirmWolfAction();
-      else if (gameState.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
-      else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
-      else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
+      // Access via ref to ensure we have latest data
+      const current = gameStateRef.current;
+      
+      if (current.nightStep === NightStep.WEREWOLF_ACTION) confirmWolfAction();
+      else if (current.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
+      else if (current.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
+      else if (current.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
       else {
-          // Should not happen, but reset time just in case
-          updateAndBroadcast({ ...gameState, timeLeft: 0 });
+          updateAndBroadcast({ ...current, timeLeft: 0 });
       }
   };
 
@@ -184,10 +196,13 @@ const App: React.FC = () => {
 
   // --- Network Message Handling ---
   const handleNetworkMessage = (msg: NetworkMessage, conn?: DataConnection) => {
+    // Always use Ref for state reads inside async/callbacks
+    const current = gameStateRef.current;
+
     if (msg.type === 'JOIN') {
       if (!isHost) return;
       
-      const newPlayerId = gameState.players.length;
+      const newPlayerId = current.players.length;
       const newPlayer: Player = {
         id: newPlayerId,
         name: msg.payload.name,
@@ -198,8 +213,8 @@ const App: React.FC = () => {
         hasLastWords: false
       };
 
-      const updatedPlayers = [...gameState.players, newPlayer];
-      const newState = { ...gameState, players: updatedPlayers };
+      const updatedPlayers = [...current.players, newPlayer];
+      const newState = { ...current, players: updatedPlayers };
       setGameState(newState);
 
       conn?.send({
@@ -295,19 +310,19 @@ const App: React.FC = () => {
   };
 
   const consumeLastWords = (playerId: number) => {
-      const updatedPlayers = gameState.players.map(p => 
+      const current = gameStateRef.current;
+      const updatedPlayers = current.players.map(p => 
           p.id === playerId ? { ...p, hasLastWords: false } : p
       );
-      updateAndBroadcast({ ...gameState, players: updatedPlayers });
+      updateAndBroadcast({ ...current, players: updatedPlayers });
   };
 
   const handleChat = (msg: ChatMessage, channel: 'public' | 'wolf') => {
-      let newState = { ...gameState };
+      let newState = { ...gameStateRef.current };
       
       // Check if sender needs to lose last words
       const sender = newState.players.find(p => p.id === msg.senderId);
       if (sender && !sender.isAlive && sender.hasLastWords && channel === 'public') {
-          sender.hasLastWords = false; // Mutate local clone or map it
           newState.players = newState.players.map(p => p.id === sender.id ? { ...p, hasLastWords: false } : p);
       }
 
@@ -334,9 +349,12 @@ const App: React.FC = () => {
 
   // --- Host Logic: Client Action Handler ---
   const handleClientAction = (action: string, data: any, fromId: number) => {
+    // Actions are processed by Host using Latest Ref State
+    const current = gameStateRef.current;
+
     if (action === 'VOTE') {
-       const newVotes = { ...gameState.currentVotes, [fromId]: data.targetId };
-       const newState = { ...gameState, currentVotes: newVotes };
+       const newVotes = { ...current.currentVotes, [fromId]: data.targetId };
+       const newState = { ...current, currentVotes: newVotes };
        updateAndBroadcast(newState);
     }
     
@@ -409,13 +427,14 @@ const App: React.FC = () => {
 
   const startGame = () => {
     if (!isHost) return;
+    const current = gameStateRef.current;
     
     const roles: Role[] = [];
-    Object.entries(gameState.config.roleCounts).forEach(([role, count]) => {
+    Object.entries(current.config.roleCounts).forEach(([role, count]) => {
       for(let i=0; i<(count as number); i++) roles.push(role as Role);
     });
     
-    while(roles.length < gameState.players.length) {
+    while(roles.length < current.players.length) {
       roles.push(Role.VILLAGER);
     }
     
@@ -424,14 +443,14 @@ const App: React.FC = () => {
       [roles[i], roles[j]] = [roles[j], roles[i]];
     }
 
-    const newPlayers = gameState.players.map((p, i) => ({
+    const newPlayers = current.players.map((p, i) => ({
       ...p,
       role: roles[i] || Role.VILLAGER,
       hasLastWords: false
     }));
 
     const newState = {
-      ...gameState,
+      ...current,
       players: newPlayers,
       phase: Phase.ROLE_REVEAL,
       storyLog: ["游戏开始。请确认身份。"]
@@ -450,12 +469,13 @@ const App: React.FC = () => {
   // --- Game Mechanics ---
   
   const startNight = () => {
+    const current = gameStateRef.current;
     const newState = {
-      ...gameState,
+      ...current,
       phase: Phase.NIGHT,
-      round: gameState.round + 1,
+      round: current.round + 1,
       nightStep: NightStep.WEREWOLF_ACTION,
-      timeLeft: ACTION_TIMEOUT_SECONDS, // Reset timer
+      timeLeft: ACTION_TIMEOUT_SECONDS, 
       wolvesTargetId: null,
       seerCheckId: null,
       witchAction: { save: false, poisonTargetId: null },
@@ -471,23 +491,21 @@ const App: React.FC = () => {
         sendAction('NIGHT_ACTION', { type: 'WOLF_KILL', targetId });
         return;
     }
-    // Update target but DO NOT reset timer
-    const newState = { ...gameState, wolvesTargetId: targetId };
+    const current = gameStateRef.current;
+    const newState = { ...current, wolvesTargetId: targetId };
     updateAndBroadcast(newState);
   };
 
   const confirmWolfAction = () => {
-    // This is now triggered automatically by timer or manually by host
-    // But since host manual confirmation is removed/deprecated for automatic flow, we rely on Timer mostly
-    // or we can keep the button for "Early Finish".
     if (!isHost) return;
+    const current = gameStateRef.current;
     
     let nextStep: NightStep = NightStep.SEER_ACTION;
     
-    if (!gameState.config.roleCounts[Role.SEER]) {
+    if (!current.config.roleCounts[Role.SEER]) {
        nextStep = NightStep.WITCH_ACTION;
     }
-    if (nextStep === NightStep.WITCH_ACTION && !gameState.config.roleCounts[Role.WITCH]) {
+    if (nextStep === NightStep.WITCH_ACTION && !current.config.roleCounts[Role.WITCH]) {
         nextStep = NightStep.NONE;
     }
 
@@ -498,10 +516,10 @@ const App: React.FC = () => {
           : "狼人请闭眼。女巫请睁眼...");
 
     const newState = { 
-        ...gameState, 
+        ...current, 
         nightStep: nextStep, 
         currentStory: story,
-        timeLeft: nextStep === NightStep.NONE ? 0 : ACTION_TIMEOUT_SECONDS // Reset timer for next role
+        timeLeft: nextStep === NightStep.NONE ? 0 : ACTION_TIMEOUT_SECONDS 
     };
     updateAndBroadcast(newState);
     if (nextStep === NightStep.NONE) resolveNight(newState);
@@ -512,20 +530,22 @@ const App: React.FC = () => {
           sendAction('NIGHT_ACTION', { type: 'SEER_CHECK', targetId });
           return;
       }
-      const newState = { ...gameState, seerCheckId: targetId };
+      const current = gameStateRef.current;
+      const newState = { ...current, seerCheckId: targetId };
       updateAndBroadcast(newState);
   };
 
   const confirmSeerAction = () => {
       if (!isHost) return;
+      const current = gameStateRef.current;
       let nextStep = NightStep.WITCH_ACTION;
       
-      if (!gameState.config.roleCounts[Role.WITCH]) {
+      if (!current.config.roleCounts[Role.WITCH]) {
           nextStep = NightStep.NONE;
       }
 
       const newState = {
-          ...gameState,
+          ...current,
           nightStep: nextStep,
           currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼...",
           timeLeft: nextStep === NightStep.NONE ? 0 : ACTION_TIMEOUT_SECONDS
@@ -540,20 +560,24 @@ const App: React.FC = () => {
           return;
       }
       
-      let newAction = { ...gameState.witchAction };
+      const current = gameStateRef.current;
+      let newAction = { ...current.witchAction };
+      
       if (type === 'save') newAction.save = !newAction.save;
-      if (type === 'poison') newAction.poisonTargetId = targetId || null;
+      // FIX: Ensure 0 is treated as a valid number, not falsy
+      if (type === 'poison') newAction.poisonTargetId = targetId !== undefined ? targetId : null;
 
-      const newState = { ...gameState, witchAction: newAction };
+      const newState = { ...current, witchAction: newAction };
       updateAndBroadcast(newState);
   };
 
   const confirmWitchAction = () => {
       if (!isHost) return;
+      const current = gameStateRef.current;
       const newState = {
-          ...gameState,
-          witchSaveUsed: gameState.witchAction.save ? true : gameState.witchSaveUsed,
-          witchPoisonUsed: gameState.witchAction.poisonTargetId !== null ? true : gameState.witchPoisonUsed,
+          ...current,
+          witchSaveUsed: current.witchAction.save ? true : current.witchSaveUsed,
+          witchPoisonUsed: current.witchAction.poisonTargetId !== null ? true : current.witchPoisonUsed,
           nightStep: NightStep.NONE,
           currentStory: "女巫请闭眼。天亮了...",
           timeLeft: 0
@@ -625,17 +649,19 @@ const App: React.FC = () => {
         sendAction('NIGHT_ACTION', { type: 'HUNTER_SHOOT', targetId });
         return;
      }
-     const newState = { ...gameState, hunterTargetId: targetId };
+     const current = gameStateRef.current;
+     const newState = { ...current, hunterTargetId: targetId };
      updateAndBroadcast(newState);
   };
 
   const confirmHunterAction = () => {
      if (!isHost) return;
-     // If timer expires and no target selected, Hunter dies without shooting
-     if (gameState.hunterTargetId === null) {
+     const current = gameStateRef.current;
+     
+     if (current.hunterTargetId === null) {
           // Hunter forfeit
           const newState = {
-            ...gameState,
+            ...current,
             phase: Phase.DAY_TRANSITION,
             nightStep: NightStep.NONE,
             timeLeft: 0,
@@ -643,8 +669,7 @@ const App: React.FC = () => {
           };
           updateAndBroadcast(newState);
           setTimeout(async () => {
-             // Basic story without hunter kill
-             const story = await generateNightStory(newState.round, gameState.players.filter(p => gameState.lastNightDeadIds.includes(p.id)), gameState.players);
+             const story = await generateNightStory(newState.round, current.players.filter(p => current.lastNightDeadIds.includes(p.id)), current.players);
              updateAndBroadcast({
                  ...newState,
                  currentStory: story,
@@ -655,16 +680,16 @@ const App: React.FC = () => {
           return;
      }
      
-     const newDeadId = gameState.hunterTargetId;
-     const updatedPlayers = gameState.players.map(p => ({
+     const newDeadId = current.hunterTargetId;
+     const updatedPlayers = current.players.map(p => ({
          ...p,
          isAlive: p.id === newDeadId ? false : p.isAlive
      }));
      
      const newState = {
-         ...gameState,
+         ...current,
          players: updatedPlayers,
-         lastNightDeadIds: [...gameState.lastNightDeadIds, newDeadId],
+         lastNightDeadIds: [...current.lastNightDeadIds, newDeadId],
          phase: Phase.DAY_TRANSITION,
          nightStep: NightStep.NONE,
          isLoadingStory: true,
@@ -685,11 +710,12 @@ const App: React.FC = () => {
 
   const startDiscussion = async () => {
       if (!isHost) return;
-      updateAndBroadcast({ ...gameState, phase: Phase.DAY_DISCUSSION, isLoadingStory: true });
-      const alivePlayers = gameState.players.filter(p => p.isAlive);
+      const current = gameStateRef.current;
+      updateAndBroadcast({ ...current, phase: Phase.DAY_DISCUSSION, isLoadingStory: true });
+      const alivePlayers = current.players.filter(p => p.isAlive);
       const prompt = await generateDiscussionTopic(alivePlayers);
       updateAndBroadcast({ 
-          ...gameState, 
+          ...gameStateRef.current, // fetch again in case async changed something (rare here but consistent)
           phase: Phase.DAY_DISCUSSION,
           currentStory: prompt,
           isLoadingStory: false 
@@ -699,7 +725,7 @@ const App: React.FC = () => {
   const startVoting = () => {
       if (!isHost) return;
       updateAndBroadcast({ 
-        ...gameState, 
+        ...gameStateRef.current, 
         currentVotes: {}, 
         phase: Phase.VOTING, 
         currentStory: "请所有幸存玩家输入座位号进行投票。" 
@@ -708,8 +734,22 @@ const App: React.FC = () => {
 
   const submitVotes = () => {
       if (!isHost) return;
+      const current = gameStateRef.current;
       const voteCounts: Record<number, number> = {};
-      Object.values(gameState.currentVotes).forEach(val => {
+      
+      // Calculate Stats Text
+      let statsText = "📊 投票详情: ";
+      const voteEntries = Object.entries(current.currentVotes);
+      
+      if (voteEntries.length === 0) {
+          statsText += "无人投票";
+      } else {
+          statsText += voteEntries.map(([voterId, targetId]) => {
+              return `${parseInt(voterId) + 1}号->${(targetId as number) + 1}号`;
+          }).join(', ');
+      }
+
+      Object.values(current.currentVotes).forEach(val => {
           const targetId = val as number;
           voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
       });
@@ -731,23 +771,23 @@ const App: React.FC = () => {
 
       if (isTie || exiledId === null) {
           updateAndBroadcast({
-              ...gameState,
-              storyLog: [...gameState.storyLog, "投票平局，无人放逐。"],
+              ...current,
+              storyLog: [...current.storyLog, statsText, "投票平局，无人放逐。"],
               currentStory: "投票平局，无人被放逐。天又要黑了..."
           });
           setTimeout(() => startNight(), 4000);
       } else {
-          const updatedPlayers = gameState.players.map(p => ({
+          const updatedPlayers = current.players.map(p => ({
               ...p,
               isAlive: p.id === exiledId ? false : p.isAlive,
               hasLastWords: p.id === exiledId ? true : p.hasLastWords // Exiled player gets Last Words
           }));
-          const exiledPlayer = gameState.players.find(p => p.id === exiledId);
+          const exiledPlayer = current.players.find(p => p.id === exiledId);
           
           const newState = {
-              ...gameState,
+              ...current,
               players: updatedPlayers,
-              storyLog: [...gameState.storyLog, `${exiledPlayer?.name} 被放逐。`],
+              storyLog: [...current.storyLog, statsText, `${exiledPlayer?.name} 被放逐。`],
               currentStory: `${exiledPlayer?.name} 被投票放逐了。请发表遗言。`
           };
           updateAndBroadcast(newState);
@@ -1218,7 +1258,7 @@ const App: React.FC = () => {
        {appMode === 'GAME' && gameState.phase !== Phase.ROLE_REVEAL && (
            <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto flex-shrink-0" ref={scrollRef}>
                {gameState.storyLog.map((log, idx) => (
-                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono">> {log}</p>
+                   <p key={idx} className={`text-xs mb-1 font-mono ${log.includes('📊') ? 'text-amber-400 font-bold' : 'text-slate-400'}`}>{log}</p>
                ))}
            </div>
        )}
