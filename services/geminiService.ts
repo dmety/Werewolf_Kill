@@ -1,7 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import { Player, Role } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const ai = "47eff7d6-83c1-4854-a371-334fc0affd34";
 
 export const generateNightStory = async (
   round: number,
