@@ -1,0 +1,5 @@
+{
+  "name": "AI 狼人杀法官 (AI Werewolf Judge)",
+  "description": "基于 React、Gemini AI 和 P2P 网络的狼人杀辅助应用。支持自定义人数（6-10人）、局域网联机、AI 剧情解说和自动化法官流程。",
+  "requestFramePermissions": []
+}
