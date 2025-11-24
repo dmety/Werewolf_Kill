@@ -42,6 +42,14 @@ export interface GameConfig {
   roleCounts: Record<Role, number>;
 }
 
+export interface ChatMessage {
+  id: string;
+  senderId: number;
+  senderName: string;
+  text: string;
+  timestamp: number;
+}
+
 export interface GameState {
   mode: number; // Player count
   config: GameConfig; // Store the full config
@@ -58,6 +66,10 @@ export interface GameState {
   witchAction: { save: boolean; poisonTargetId: number | null };
   hunterTargetId: number | null;
   
+  // Voting & Chat
+  currentVotes: Record<number, number>; // voterId -> targetId
+  wolfChatHistory: ChatMessage[];
+
   lastNightDeadIds: number[];
   winner: 'WEREWOLVES' | 'VILLAGERS' | null;
   
@@ -74,7 +86,8 @@ export type NetworkMessage =
   | { type: 'JOIN'; payload: { name: string; peerId: string } }
   | { type: 'WELCOME'; payload: { playerId: number; gameState: GameState } }
   | { type: 'STATE_UPDATE'; payload: { gameState: GameState } }
-  | { type: 'ACTION'; payload: { action: string; data: any; fromPlayerId: number } };
+  | { type: 'ACTION'; payload: { action: string; data: any; fromPlayerId: number } }
+  | { type: 'CHAT'; payload: { message: ChatMessage } };
 
 export const DEFAULT_ROLES_6: Record<Role, number> = {
   [Role.WEREWOLF]: 2,

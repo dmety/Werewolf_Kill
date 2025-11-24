@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Peer, DataConnection } from 'peerjs';
-import { GameState, Phase, Role, Player, NightStep, GameConfig, NetworkMessage, DEFAULT_ROLES_6 } from './types';
+import { GameState, Phase, Role, Player, NightStep, GameConfig, NetworkMessage, DEFAULT_ROLES_6, ChatMessage } from './types';
 import { PlayerCard } from './components/PlayerCard';
 import { Button } from './components/Button';
 import { GameSetup } from './components/GameSetup';
@@ -22,6 +22,8 @@ const createInitialState = (): GameState => ({
   witchPoisonUsed: false,
   witchAction: { save: false, poisonTargetId: null },
   hunterTargetId: null,
+  currentVotes: {},
+  wolfChatHistory: [],
   lastNightDeadIds: [],
   winner: null,
   storyLog: [],
@@ -48,9 +50,10 @@ const App: React.FC = () => {
   const [playerName, setPlayerName] = useState('');
   
   // --- Helper State ---
-  const [votes, setVotes] = useState<Record<number, number>>({});
   const [isMuted, setIsMuted] = useState(false); // TTS Mute toggle
+  const [chatInput, setChatInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -58,6 +61,13 @@ const App: React.FC = () => {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [gameState.storyLog, gameState.currentStory]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    if (chatScrollRef.current) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [gameState.wolfChatHistory]);
 
   // --- TTS Trigger ---
   useEffect(() => {
@@ -78,46 +88,52 @@ const App: React.FC = () => {
   const handleNetworkMessageRef = useRef<(msg: NetworkMessage, conn?: DataConnection) => void>(() => {});
 
   // --- Networking: Initialization ---
+  const initPeer = () => {
+      if (peerRef.current) return;
+
+      const peer = new Peer();
+      
+      peer.on('open', (id) => {
+        setPeerId(id);
+        console.log('My Peer ID:', id);
+      });
+  
+      peer.on('error', (err) => {
+        console.error("PeerJS Error:", err);
+        if (err.type === 'peer-unavailable') {
+           alert("房间不存在或 ID 错误");
+           leaveRoom();
+        }
+      });
+  
+      peer.on('connection', (conn) => {
+        // Host Logic: Receiving a connection
+        conn.on('data', (data) => {
+          // Use the ref to ensure we have latest state (isHost, etc)
+          if (handleNetworkMessageRef.current) {
+             handleNetworkMessageRef.current(data as NetworkMessage, conn);
+          }
+        });
+  
+        conn.on('open', () => {
+          // Add to connections list if host
+          if (connectionsRef.current) {
+              connectionsRef.current.push(conn);
+          }
+        });
+        conn.on('close', () => {
+            connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
+        });
+      });
+  
+      peerRef.current = peer;
+  };
+
   useEffect(() => {
-    const peer = new Peer();
-    
-    peer.on('open', (id) => {
-      setPeerId(id);
-      console.log('My Peer ID:', id);
-    });
-
-    peer.on('error', (err) => {
-      console.error("PeerJS Error:", err);
-      if (err.type === 'peer-unavailable') {
-         alert("房间不存在或 ID 错误");
-         setAppMode('MENU');
-      }
-    });
-
-    peer.on('connection', (conn) => {
-      // Host Logic: Receiving a connection
-      conn.on('data', (data) => {
-        // Use the ref to ensure we have latest state (isHost, etc)
-        if (handleNetworkMessageRef.current) {
-           handleNetworkMessageRef.current(data as NetworkMessage, conn);
-        }
-      });
-
-      conn.on('open', () => {
-        // Add to connections list if host
-        if (connectionsRef.current) {
-            connectionsRef.current.push(conn);
-        }
-      });
-      conn.on('close', () => {
-          connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
-      });
-    });
-
-    peerRef.current = peer;
-    
+    initPeer();
     return () => {
-      peer.destroy();
+      peerRef.current?.destroy();
+      peerRef.current = null;
     };
   }, []);
 
@@ -145,19 +161,17 @@ const App: React.FC = () => {
       const updatedPlayers = [...gameState.players, newPlayer];
       
       // Update local state (Host)
-      setGameState(prev => ({
-        ...prev,
-        players: updatedPlayers
-      }));
+      const newState = { ...gameState, players: updatedPlayers };
+      setGameState(newState);
 
       // Send Welcome to new player
       conn?.send({
         type: 'WELCOME',
-        payload: { playerId: newPlayerId, gameState: { ...gameState, players: updatedPlayers } }
+        payload: { playerId: newPlayerId, gameState: newState }
       } as NetworkMessage);
 
       // Broadcast update to all others
-      broadcastState({ ...gameState, players: updatedPlayers });
+      broadcastState(newState);
     }
 
     if (msg.type === 'WELCOME') {
@@ -180,6 +194,15 @@ const App: React.FC = () => {
       // Host receives Action (Vote, Night Action)
       if (!isHost) return;
       handleClientAction(msg.payload.action, msg.payload.data, msg.payload.fromPlayerId);
+    }
+
+    if (msg.type === 'CHAT') {
+        // Only Host receives CHAT from clients, then broadcasts via state
+        if (isHost) {
+            const newHistory = [...gameState.wolfChatHistory, msg.payload.message];
+            const newState = { ...gameState, wolfChatHistory: newHistory };
+            updateAndBroadcast(newState);
+        }
     }
   };
 
@@ -207,15 +230,59 @@ const App: React.FC = () => {
     }
   };
 
+  const sendChatMessage = () => {
+      if (!chatInput.trim()) return;
+      
+      const me = gameState.players.find(p => p.id === myPlayerId);
+      const msg: ChatMessage = {
+          id: Date.now().toString() + Math.random(),
+          senderId: myPlayerId!,
+          senderName: me?.name || 'Unknown',
+          text: chatInput,
+          timestamp: Date.now()
+      };
+
+      if (isHost) {
+          const newState = { ...gameState, wolfChatHistory: [...gameState.wolfChatHistory, msg] };
+          updateAndBroadcast(newState);
+      } else {
+          hostConnRef.current?.send({
+              type: 'CHAT',
+              payload: { message: msg }
+          });
+      }
+      setChatInput('');
+  };
+
+  const leaveRoom = () => {
+      // Reset State
+      setGameState(createInitialState());
+      setAppMode('MENU');
+      setMyPlayerId(null);
+      setIsHost(false);
+      
+      // Close Connections
+      connectionsRef.current.forEach(c => c.close());
+      connectionsRef.current = [];
+      
+      if (hostConnRef.current) {
+          hostConnRef.current.close();
+          hostConnRef.current = null;
+      }
+
+      // Re-init peer to get a fresh ID if needed, or just keep same peer
+      // peerRef.current is usually fine to keep open, but let's just clear connections.
+  };
+
   // --- Host Logic: Client Action Handler ---
   const handleClientAction = (action: string, data: any, fromId: number) => {
     // console.log(`Action ${action} from ${fromId}`, data);
     
     if (action === 'VOTE') {
-       setVotes(prev => {
-         const newVotes = { ...prev, [fromId]: data.targetId };
-         return newVotes;
-       });
+       // Update votes in GameState
+       const newVotes = { ...gameState.currentVotes, [fromId]: data.targetId };
+       const newState = { ...gameState, currentVotes: newVotes };
+       updateAndBroadcast(newState);
     }
     
     if (action === 'NIGHT_ACTION') {
@@ -276,7 +343,10 @@ const App: React.FC = () => {
         alert("连接失败: " + err);
         setAppMode('MENU');
     });
-    conn?.on('close', () => alert("Disconnected from host"));
+    conn?.on('close', () => {
+        alert("与房主断开连接");
+        leaveRoom();
+    });
     
     setAppMode('JOIN'); // Wait for Welcome
   };
@@ -328,7 +398,11 @@ const App: React.FC = () => {
       nightStep: NightStep.WEREWOLF_ACTION,
       wolvesTargetId: null,
       seerCheckId: null,
+      // Witch potion usage persists across rounds, but action target resets
       witchAction: { save: false, poisonTargetId: null },
+      hunterTargetId: null,
+      currentVotes: {}, // Clear votes
+      // wolfChatHistory: [], // Optional: Clear chat every night? Keeping history is usually better.
       currentStory: "天黑请闭眼。狼人请睁眼，请确认你们的袭击目标..."
     };
     updateAndBroadcast(newState);
@@ -358,7 +432,6 @@ const App: React.FC = () => {
     }
 
     // Check if Witch exists (if we are skipping Seer or Seer is done)
-    // Note: This logic assumes if we skip Seer, we check Witch.
     if (nextStep === NightStep.WITCH_ACTION && !gameState.config.roleCounts[Role.WITCH]) {
         nextStep = NightStep.NONE;
     }
@@ -445,7 +518,8 @@ const App: React.FC = () => {
       const hunter = updatedPlayers.find(p => p.role === Role.HUNTER);
       const hunterDied = hunter && deadIds.includes(hunter.id);
       const hunterPoisoned = hunter && witchAction.poisonTargetId === hunter.id;
-      // Hunter can shoot if died by wolf (not poisoned)
+      // Hunter can shoot if died by wolf (not poisoned) or just regular death? 
+      // Traditional rules: Hunter cannot shoot if poisoned.
       const canHunterShoot = hunterDied && !hunterPoisoned;
 
       const nextPhase = canHunterShoot ? Phase.NIGHT : Phase.DAY_TRANSITION;
@@ -537,15 +611,19 @@ const App: React.FC = () => {
 
   const startVoting = () => {
       if (!isHost) return;
-      setVotes({});
-      updateAndBroadcast({ ...gameState, phase: Phase.VOTING, currentStory: "请所有幸存玩家进行投票。" });
+      updateAndBroadcast({ 
+        ...gameState, 
+        currentVotes: {}, 
+        phase: Phase.VOTING, 
+        currentStory: "请所有幸存玩家进行投票。" 
+      });
   };
 
   const submitVotes = () => {
       if (!isHost) return;
-      // Calculate
+      // Calculate from GameState.currentVotes
       const voteCounts: Record<number, number> = {};
-      (Object.values(votes) as number[]).forEach(val => {
+      Object.values(gameState.currentVotes).forEach(val => {
           voteCounts[val] = (voteCounts[val] || 0) + 1;
       });
 
@@ -632,8 +710,13 @@ const App: React.FC = () => {
 
   const renderLobby = () => (
       <div className="max-w-4xl mx-auto p-6 space-y-8">
+          <div className="flex justify-between items-center">
+             <Button variant="secondary" onClick={leaveRoom} className="text-sm">← 离开房间</Button>
+             <h2 className="text-2xl font-bold text-slate-300">游戏大厅</h2>
+             <div className="w-20"></div> {/* Spacer */}
+          </div>
+          
           <div className="text-center">
-              <h2 className="text-2xl font-bold text-slate-300">游戏大厅</h2>
               {isHost && (
                   <div className="mt-4 bg-indigo-900/30 p-4 rounded-xl border border-indigo-500/50 inline-block">
                       <p className="text-xs text-indigo-300 uppercase tracking-wide">房间 ID</p>
@@ -666,7 +749,8 @@ const App: React.FC = () => {
     const me = gameState.players.find(p => p.id === myPlayerId);
     if (!me) return null;
     return (
-        <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+        <div className="flex flex-col items-center justify-center h-full p-8 text-center relative">
+            <Button variant="secondary" onClick={leaveRoom} className="absolute top-4 left-4">退出</Button>
             <h2 className="text-2xl font-bold mb-8">你的身份是</h2>
             <div className="animate-bounce mb-8 text-8xl">
                 {me.role === Role.WEREWOLF ? '🐺' : 
@@ -683,6 +767,35 @@ const App: React.FC = () => {
     );
   };
 
+  const renderWolfChat = () => {
+      // Chat is visible to wolves during night
+      // Or maybe always? Usually only night.
+      // For this implementation, let's keep it visible at night for wolves.
+      return (
+        <div className="bg-slate-900 border-t border-slate-700 p-2 flex flex-col h-48">
+            <div className="text-xs text-slate-500 mb-1">🐺 狼人频道</div>
+            <div className="flex-1 overflow-y-auto space-y-2 mb-2 bg-slate-950/50 p-2 rounded" ref={chatScrollRef}>
+                {gameState.wolfChatHistory.map(msg => (
+                    <div key={msg.id} className="text-xs">
+                        <span className="font-bold text-red-400">{msg.senderName}:</span> <span className="text-slate-300">{msg.text}</span>
+                    </div>
+                ))}
+                {gameState.wolfChatHistory.length === 0 && <p className="text-xs text-slate-600 italic">暂无消息...</p>}
+            </div>
+            <div className="flex gap-2">
+                <input 
+                    className="flex-1 bg-slate-800 rounded px-2 py-1 text-sm outline-none border border-slate-700 focus:border-red-500"
+                    value={chatInput}
+                    onChange={e => setChatInput(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && sendChatMessage()}
+                    placeholder="与同伴交流..."
+                />
+                <Button variant="secondary" className="py-1 px-3 text-sm" onClick={sendChatMessage}>发送</Button>
+            </div>
+        </div>
+      );
+  };
+
   const renderGame = () => {
      // Determine if I can act
      const me = gameState.players.find(p => p.id === myPlayerId);
@@ -696,33 +809,45 @@ const App: React.FC = () => {
      // Voting Phase Special
      if (gameState.phase === Phase.VOTING) {
          return (
-             <div className="p-4 max-w-2xl mx-auto space-y-6">
-                 <div className="text-center space-y-2">
-                     <h2 className="text-2xl font-bold text-amber-400">投票环节</h2>
-                     <p>{gameState.currentStory}</p>
+             <div className="p-4 max-w-2xl mx-auto space-y-6 flex flex-col h-full">
+                 <div className="flex justify-between items-center">
+                    <Button variant="secondary" onClick={leaveRoom} className="text-xs">退出</Button>
+                    <h2 className="text-2xl font-bold text-amber-400">投票环节</h2>
+                    <div className="w-10"></div>
                  </div>
-                 <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                     {gameState.players.map(p => (
-                         <PlayerCard 
-                            key={p.id} 
-                            player={p} 
-                            selectable={p.isAlive && me?.isAlive} // Only alive can vote
-                            selected={votes[myPlayerId!] === p.id}
-                            onSelect={() => me?.isAlive && sendAction('VOTE', { targetId: p.id })}
-                            isMe={p.id === myPlayerId}
-                         />
-                     ))}
+                 <p className="text-center">{gameState.currentStory}</p>
+                 
+                 <div className="grid grid-cols-2 md:grid-cols-3 gap-3 flex-grow">
+                     {gameState.players.map(p => {
+                         // Calculate who voted for this player
+                         const voters = Object.entries(gameState.currentVotes)
+                            .filter(([_, target]) => target === p.id)
+                            .map(([voterId]) => {
+                                const vId = parseInt(voterId);
+                                return gameState.players.find(pl => pl.id === vId)?.name || 'Unknown';
+                            });
+                         
+                         return (
+                            <div key={p.id} className="relative">
+                                <PlayerCard 
+                                    player={p} 
+                                    selectable={p.isAlive && me?.isAlive} // Only alive can vote
+                                    selected={myPlayerId !== null && gameState.currentVotes[myPlayerId] === p.id}
+                                    onSelect={() => me?.isAlive && sendAction('VOTE', { targetId: p.id })}
+                                    isMe={p.id === myPlayerId}
+                                />
+                                {voters.length > 0 && (
+                                    <div className="absolute -bottom-2 -right-2 bg-amber-600 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center font-bold border-2 border-slate-900 z-10">
+                                        {voters.length}
+                                    </div>
+                                )}
+                            </div>
+                         );
+                     })}
                  </div>
+                 
                  {isHost && (
                      <div className="bg-slate-800 p-4 rounded mt-4">
-                         <h4 className="text-xs font-bold mb-2">投票统计 (仅房主可见)</h4>
-                         <div className="flex flex-wrap gap-2">
-                            {Object.entries(votes).map(([voterId, targetId]) => (
-                                <span key={voterId} className="text-xs bg-slate-700 px-2 py-1 rounded">
-                                    {gameState.players[parseInt(voterId)].name} -&gt; {gameState.players[targetId as number].name}
-                                </span>
-                            ))}
-                         </div>
                          <Button fullWidth className="mt-2" onClick={submitVotes}>公布结果</Button>
                      </div>
                  )}
@@ -732,15 +857,18 @@ const App: React.FC = () => {
 
      return (
          <div className="flex flex-col h-full max-w-4xl mx-auto p-4 space-y-6">
-            <div className="text-center">
-                 <div className="inline-block bg-indigo-900/50 px-3 py-1 rounded-full text-xs font-bold mb-2">
-                     第 {gameState.round} 天 - {gameState.phase === Phase.NIGHT ? "黑夜" : "白天"}
+            <div className="flex justify-between items-center relative">
+                 <Button variant="secondary" onClick={leaveRoom} className="text-xs absolute left-0">退出</Button>
+                 <div className="w-full text-center">
+                    <div className="inline-block bg-indigo-900/50 px-3 py-1 rounded-full text-xs font-bold mb-2">
+                        第 {gameState.round} 天 - {gameState.phase === Phase.NIGHT ? "黑夜" : "白天"}
+                    </div>
+                    <h2 className="text-xl font-bold text-slate-100 px-12">{gameState.currentStory}</h2>
                  </div>
-                 <h2 className="text-xl font-bold text-slate-100">{gameState.currentStory}</h2>
              </div>
              
              {/* Main Grid */}
-             <div className="grid grid-cols-3 md:grid-cols-4 gap-3">
+             <div className="grid grid-cols-3 md:grid-cols-4 gap-3 flex-grow overflow-y-auto pb-4">
                  {gameState.players.map(p => (
                      <PlayerCard
                         key={p.id}
@@ -762,8 +890,12 @@ const App: React.FC = () => {
                         onSelect={() => {
                             if (!canAct) return;
                             if (gameState.nightStep === NightStep.WEREWOLF_ACTION) handleWolfSelect(p.id);
+                            // Seer can check only 1, so overwriting is fine
                             if (gameState.nightStep === NightStep.SEER_ACTION) handleSeerCheck(p.id);
-                            if (gameState.nightStep === NightStep.WITCH_ACTION) handleWitchAction('poison', p.id);
+                            // Witch poisoning
+                            if (gameState.nightStep === NightStep.WITCH_ACTION && !gameState.witchPoisonUsed) {
+                                handleWitchAction('poison', p.id);
+                            }
                             if (gameState.nightStep === NightStep.HUNTER_ACTION) handleHunterShoot(p.id);
                         }}
                      />
@@ -774,8 +906,8 @@ const App: React.FC = () => {
              <div className="mt-auto">
                  {/* Seer Result */}
                  {me?.role === Role.SEER && gameState.seerCheckId !== null && (
-                     <div className="bg-indigo-900/30 p-3 rounded text-center mb-4 border border-indigo-500">
-                         查验结果: {gameState.players[gameState.seerCheckId].role === Role.WEREWOLF ? "🐺 狼人" : "✅ 好人"}
+                     <div className="bg-indigo-900/30 p-3 rounded text-center mb-4 border border-indigo-500 animate-pulse">
+                         查验结果: <span className="font-bold text-xl ml-2">{gameState.players[gameState.seerCheckId].role === Role.WEREWOLF ? "🐺 狼人" : "✅ 好人"}</span>
                      </div>
                  )}
                  {/* Witch Controls */}
@@ -789,8 +921,14 @@ const App: React.FC = () => {
                          >
                              使用解药 ({gameState.wolvesTargetId ? "有人被杀" : "平安"})
                          </Button>
+                         <div className="flex items-center text-xs text-slate-400 px-2">
+                             {gameState.witchPoisonUsed ? "毒药已用" : "请点击玩家头像使用毒药"}
+                         </div>
                      </div>
                  )}
+
+                 {/* Wolf Chat - Only visible to wolves at night (or always if prefered, here only night) */}
+                 {me?.role === Role.WEREWOLF && gameState.phase === Phase.NIGHT && renderWolfChat()}
 
                  {/* Phase Controls (Host Only usually, but actions are sent by clients) */}
                  {isHost && gameState.phase === Phase.NIGHT && gameState.nightStep !== NightStep.NONE && (
@@ -799,16 +937,16 @@ const App: React.FC = () => {
                         else if (gameState.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
                         else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
                         else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
-                     }}>
+                     }} className="mt-2">
                          法官：确认并继续
                      </Button>
                  )}
                  
                  {isHost && gameState.phase === Phase.DAY_TRANSITION && (
-                     <Button fullWidth onClick={startDiscussion}>开始讨论</Button>
+                     <Button fullWidth onClick={startDiscussion} className="mt-2">开始讨论</Button>
                  )}
                  {isHost && gameState.phase === Phase.DAY_DISCUSSION && (
-                     <Button fullWidth onClick={startVoting}>发起投票</Button>
+                     <Button fullWidth onClick={startVoting} className="mt-2">发起投票</Button>
                  )}
              </div>
          </div>
@@ -826,17 +964,23 @@ const App: React.FC = () => {
          {isMuted ? "🔇" : "🔊"}
        </button>
 
-       <main className="flex-grow overflow-y-auto">
+       <main className="flex-grow overflow-y-auto flex flex-col">
           {appMode === 'MENU' && renderMenu()}
           {appMode === 'SETUP' && <GameSetup onStart={createRoom} onBack={() => setAppMode('MENU')} />}
-          {appMode === 'JOIN' && <div className="text-center p-10">正在加入房间...<br/><span className="text-xs text-slate-500 mt-2">若长时间无反应，请检查房间 ID 是否正确</span></div>}
+          {appMode === 'JOIN' && (
+              <div className="text-center p-10 relative">
+                  <Button variant="secondary" onClick={leaveRoom} className="absolute top-4 left-4">取消</Button>
+                  正在加入房间...<br/>
+                  <span className="text-xs text-slate-500 mt-2">若长时间无反应，请检查房间 ID 是否正确</span>
+              </div>
+          )}
           {appMode === 'LOBBY' && renderLobby()}
           {appMode === 'GAME' && (
               gameState.phase === Phase.ROLE_REVEAL ? renderRoleReveal() :
               gameState.phase === Phase.GAME_OVER ? 
-                <div className="text-center p-10">
-                    <h1 className="text-4xl">{gameState.winner === 'WEREWOLVES' ? '狼人胜利' : '好人胜利'}</h1>
-                    <Button className="mt-4" onClick={() => window.location.reload()}>返回首页</Button>
+                <div className="text-center p-10 flex flex-col items-center justify-center h-full">
+                    <h1 className="text-4xl font-bold mb-4">{gameState.winner === 'WEREWOLVES' ? '🐺 狼人胜利' : '🧑‍🌾 好人胜利'}</h1>
+                    <Button className="mt-4" onClick={leaveRoom}>返回首页</Button>
                 </div> 
                 : renderGame()
           )}
@@ -844,9 +988,9 @@ const App: React.FC = () => {
        
        {/* Log Drawer */}
        {appMode === 'GAME' && gameState.phase !== Phase.ROLE_REVEAL && (
-           <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto" ref={scrollRef}>
+           <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto flex-shrink-0" ref={scrollRef}>
                {gameState.storyLog.map((log, idx) => (
-                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono"> {log}</p>
+                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono">> {log}</p>
                ))}
            </div>
        )}
