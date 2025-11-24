@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { Role, GameConfig } from '../types';
 import { Button } from './Button';
@@ -33,7 +34,7 @@ export const GameSetup: React.FC<GameSetupProps> = ({ onStart, onBack }) => {
   };
 
   const isValid = () => {
-    const sum = Object.values(roles).reduce((a, b) => a + b, 0);
+    const sum = (Object.values(roles) as number[]).reduce((a, b) => a + b, 0);
     return sum === totalPlayers && roles[Role.WEREWOLF] > 0;
   };
 

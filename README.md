@@ -1,20 +1,69 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
 
-# Run and deploy your AI Studio app
+# AI 狼人杀法官 (AI Werewolf Judge)
 
-This contains everything you need to run your app locally.
+这是一个基于 Web 的现代化狼人杀辅助应用，结合了 Google Gemini AI 生成剧情、WebRTC (PeerJS) 局域网联机以及浏览器原生的语音合成技术。
 
-View your app in AI Studio: https://ai.studio/apps/drive/1Ppa8SwBGY0FOpQA9p7yyGVebv3yGnQfq
+## ✨ 功能特点
 
-## Run Locally
+*   **灵活的房间设置**：支持 6-10 人局域网联机，只需一人创建房间，其他人通过 ID 加入。
+*   **AI 法官**：利用 Google Gemini 模型，根据昨晚的死亡情况动态生成恐怖/悬疑的剧情描述，告别千篇一律的台词。
+*   **自动化流程**：全自动处理天黑/天亮流程、狼人杀人、女巫救人/毒人、预言家查验等逻辑。
+*   **语音播报**：内置浏览器原生 TTS (Text-to-Speech)，无需额外 API 配置，自动朗读法官指令和剧情。
+*   **多端同步**：利用 P2P 技术同步所有玩家状态，确保游戏进程一致。
 
-**Prerequisites:**  Node.js
+## 🛠️ 技术栈
 
+*   **React 19**: 前端框架
+*   **TypeScript**: 类型安全
+*   **Google Gemini API**: 生成剧情文本 (需配置 API Key)
+*   **PeerJS**: WebRTC 封装，用于局域网 P2P 通信
+*   **Web Speech API**: 浏览器原生语音合成
+*   **Tailwind CSS**: 样式设计
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## 🚀 快速开始
+
+### 1. 配置环境
+
+本项目是一个纯前端项目，但依赖 Google Gemini API 来生成文本。
+
+在项目根目录下，确保环境变量中存在 `API_KEY`。通常这在开发环境中通过 `.env` 或运行时注入完成。
+
+### 2. 安装依赖
+
+```bash
+npm install
+```
+
+### 3. 启动项目
+
+```bash
+npm start
+```
+
+### 4. 游戏流程
+
+1.  **创建房间**：
+    *   在主页输入昵称。
+    *   点击“创建房间”。
+    *   设置游戏人数（6-10人）和角色配置。
+    *   将生成的 **房间 ID** 分享给在同一局域网（或网络互通）下的朋友。
+
+2.  **加入房间**：
+    *   其他玩家输入昵称和收到的 **房间 ID**，点击“加入”。
+
+3.  **开始游戏**：
+    *   全员到齐后，房主点击“开始游戏”。
+    *   系统自动分配身份，玩家确认身份后进入天黑。
+    *   根据语音提示进行操作（狼人杀人、女巫行动等）。
+
+## ⚠️ 注意事项
+
+*   **语音功能**：依赖浏览器对 `Web Speech API` 的支持（Chrome, Edge, Safari 等现代浏览器均支持）。请确保设备未静音。
+*   **网络连接**：PeerJS 依赖 WebRTC，某些复杂的网络环境（如对称 NAT）可能导致连接失败。建议在同一 Wi-Fi 下游玩。
+*   **AI Key**：虽然语音播报不需要 Key，但剧情生成仍然需要有效的 Gemini API Key。
+
+## 📝 角色配置逻辑
+
+*   **6人局**：2狼 2民 1预 1猎
+*   **8人局**：3狼 3民 1预 1女
+*   **自定义**：可在创建房间时微调角色数量。

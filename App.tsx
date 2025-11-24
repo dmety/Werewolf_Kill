@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { Peer, DataConnection } from 'peerjs';
 import { GameState, Phase, Role, Player, NightStep, GameConfig, NetworkMessage } from './types';
@@ -5,6 +6,7 @@ import { PlayerCard } from './components/PlayerCard';
 import { Button } from './components/Button';
 import { GameSetup } from './components/GameSetup';
 import { generateNightStory, generateDiscussionTopic } from './services/geminiService';
+import { speak, stopSpeech } from './services/ttsService';
 
 // Initial State Factory
 const createInitialState = (): GameState => ({
@@ -46,6 +48,7 @@ const App: React.FC = () => {
   
   // --- Helper State ---
   const [votes, setVotes] = useState<Record<number, number>>({});
+  const [isMuted, setIsMuted] = useState(false); // TTS Mute toggle
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll logs
@@ -54,6 +57,20 @@ const App: React.FC = () => {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [gameState.storyLog, gameState.currentStory]);
+
+  // --- TTS Trigger ---
+  useEffect(() => {
+    // When currentStory changes, speak it if not muted
+    // We skip speaking during loading state or empty strings
+    if (!isMuted && gameState.currentStory && !gameState.isLoadingStory) {
+      speak(gameState.currentStory);
+    }
+  }, [gameState.currentStory, gameState.isLoadingStory, isMuted]);
+
+  // Stop speech when component unmounts or game over
+  useEffect(() => {
+    return () => stopSpeech();
+  }, []);
 
   // --- Networking: Initialization ---
   useEffect(() => {
@@ -147,12 +164,7 @@ const App: React.FC = () => {
   const broadcastState = (newState: GameState) => {
     // In a real app, we should scrub secret info (roles) for clients
     // For this prototype, we send full state but client UI hides it.
-    // To satisfy "Senior Engineer" robustness, let's do a simple scrub for clients.
-    
     connectionsRef.current.forEach(conn => {
-       // Find target player ID to know what to reveal? 
-       // Simplification: Clients get full state, trust the UI. 
-       // Implementing full view filtering for 10 players in one file is too verbose.
        conn.send({ type: 'STATE_UPDATE', payload: { gameState: newState } });
     });
   };
@@ -175,8 +187,6 @@ const App: React.FC = () => {
     if (action === 'VOTE') {
        setVotes(prev => {
          const newVotes = { ...prev, [fromId]: data.targetId };
-         // Check if all alive players voted? 
-         // For now, let Host manually "Submit Votes" to close voting.
          return newVotes;
        });
     }
@@ -238,23 +248,6 @@ const App: React.FC = () => {
   const startGame = () => {
     if (!isHost) return;
     
-    // Distribute Roles
-    // We need to fetch the config somehow, or just store it in state?
-    // Let's re-calculate from player count or assume standard for now if custom config lost. 
-    // Wait, we didn't store the config in state. Let's assume standard distribution for simplicity 
-    // OR we should have stored it. 
-    // Implementation Fix: Store `GameConfig` in a ref or state. 
-    // I will use a simple distribution algorithm based on current player count if config missing,
-    // but ideally `GameSetup` passed it.
-    
-    // For this code block, I will assume we passed config to `createRoom` and stored in a Ref
-    // But since I can't easily add a Ref without re-rendering, let's just do a random distribution 
-    // matching the player count using a heuristic or the config if I can save it.
-    
-    // Hack: I will re-use DEFAULT_ROLES logic based on player count for now, 
-    // as passing config through the state machine requires more changes. 
-    // Actually, I can check `gameState.mode` (player count) and approximate.
-    
     const count = gameState.players.length;
     // Default fallback
     const roles: Role[] = [];
@@ -313,9 +306,6 @@ const App: React.FC = () => {
     setGameState(newState);
     broadcastState(newState);
   };
-
-  // ... (Night Logic methods reused but calling updateAndBroadcast)
-  // Re-implementing core logic briefly to ensure state consistency
   
   const handleWolfSelect = (targetId: number) => {
     if (!isHost) {
@@ -323,9 +313,6 @@ const App: React.FC = () => {
         return;
     }
     setGameState(prev => ({ ...prev, wolvesTargetId: targetId }));
-    // Don't broadcast selection immediately to avoid leaking to other wolves? 
-    // Actually wolves should see each other. Broadcast is fine if UI hides it for non-wolves.
-    // For prototype: broadcast.
     broadcastState({ ...gameState, wolvesTargetId: targetId });
   };
 
@@ -333,7 +320,7 @@ const App: React.FC = () => {
     if (!isHost) return;
     let nextStep = NightStep.SEER_ACTION;
     const seer = gameState.players.find(p => p.role === Role.SEER);
-    if (!seer?.isAlive) nextStep = gameState.mode >= 8 ? NightStep.WITCH_ACTION : NightStep.NONE; // Simplified check
+    if (!seer?.isAlive) nextStep = gameState.mode >= 8 ? NightStep.WITCH_ACTION : NightStep.NONE;
 
     const newState = {
       ...gameState,
@@ -477,8 +464,6 @@ const App: React.FC = () => {
      };
      updateAndBroadcast(newState);
      
-     // Generate story again? Or just trigger day. 
-     // Trigger day narrative manually for simplicity here
      setTimeout(async () => {
          const story = await generateNightStory(newState.round, updatedPlayers.filter(p => newState.lastNightDeadIds.includes(p.id) || p.id === newDeadId), updatedPlayers);
          updateAndBroadcast({
@@ -513,7 +498,7 @@ const App: React.FC = () => {
       if (!isHost) return;
       // Calculate
       const voteCounts: Record<number, number> = {};
-      Object.values(votes).forEach(val => {
+      (Object.values(votes) as number[]).forEach(val => {
           voteCounts[val] = (voteCounts[val] || 0) + 1;
       });
 
@@ -784,7 +769,16 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col">
+    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col relative">
+       {/* Sound Toggle */}
+       <button 
+         onClick={() => setIsMuted(!isMuted)}
+         className="absolute top-4 right-4 z-50 bg-slate-800 p-2 rounded-full border border-slate-700 hover:bg-slate-700"
+         title={isMuted ? "开启语音" : "静音"}
+       >
+         {isMuted ? "🔇" : "🔊"}
+       </button>
+
        <main className="flex-grow overflow-y-auto">
           {appMode === 'MENU' && renderMenu()}
           {appMode === 'SETUP' && <GameSetup onStart={createRoom} onBack={() => setAppMode('MENU')} />}
