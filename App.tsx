@@ -16,6 +16,7 @@ const createInitialState = (): GameState => ({
   round: 0,
   players: [],
   nightStep: NightStep.NONE,
+  timeLeft: 0,
   wolvesTargetId: null,
   seerCheckId: null,
   witchSaveUsed: false,
@@ -32,6 +33,8 @@ const createInitialState = (): GameState => ({
   isLoadingStory: false,
   roomId: undefined
 });
+
+const ACTION_TIMEOUT_SECONDS = 20;
 
 const App: React.FC = () => {
   // --- App Modes ---
@@ -91,6 +94,44 @@ const App: React.FC = () => {
   useEffect(() => {
     return () => stopSpeech();
   }, []);
+
+  // --- Timer System (Host Only) ---
+  useEffect(() => {
+    if (!isHost) return;
+    // Timer only active during Night Steps (not NONE) or Voting?
+    // User asked for "Night action roles have 20s limit".
+    const isActionPhase = gameState.phase === Phase.NIGHT && gameState.nightStep !== NightStep.NONE;
+    
+    if (!isActionPhase) return;
+    if (gameState.timeLeft <= 0) return;
+
+    const timer = setTimeout(() => {
+        const newTime = gameState.timeLeft - 1;
+        if (newTime <= 0) {
+            handleTimerExpire();
+        } else {
+            // Update time locally and broadcast. 
+            // Note: Broadcasting every second might be heavy, but necessary for countdown sync.
+            // Optimized: We could just update local state and let clients predict, but broadcasting is safer for logic.
+            updateAndBroadcast({ ...gameState, timeLeft: newTime });
+        }
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [gameState.timeLeft, gameState.phase, gameState.nightStep, isHost]);
+
+  const handleTimerExpire = () => {
+      // Auto-advance logic based on current step
+      if (gameState.nightStep === NightStep.WEREWOLF_ACTION) confirmWolfAction();
+      else if (gameState.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
+      else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
+      else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
+      else {
+          // Should not happen, but reset time just in case
+          updateAndBroadcast({ ...gameState, timeLeft: 0 });
+      }
+  };
+
 
   // --- Networking: Message Handler Ref Pattern ---
   const handleNetworkMessageRef = useRef<(msg: NetworkMessage, conn?: DataConnection) => void>(() => {});
@@ -249,9 +290,6 @@ const App: React.FC = () => {
               type: 'CHAT',
               payload: { message: msg, channel }
           });
-          // Client optimistically assumes message sent? No, rely on state update.
-          // But we need to tell Host to consume last words via the message or action?
-          // The host handles the consumption logic inside handleChat/updates
       }
       setChatInput('');
   };
@@ -417,6 +455,7 @@ const App: React.FC = () => {
       phase: Phase.NIGHT,
       round: gameState.round + 1,
       nightStep: NightStep.WEREWOLF_ACTION,
+      timeLeft: ACTION_TIMEOUT_SECONDS, // Reset timer
       wolvesTargetId: null,
       seerCheckId: null,
       witchAction: { save: false, poisonTargetId: null },
@@ -432,12 +471,17 @@ const App: React.FC = () => {
         sendAction('NIGHT_ACTION', { type: 'WOLF_KILL', targetId });
         return;
     }
-    setGameState(prev => ({ ...prev, wolvesTargetId: targetId }));
-    broadcastState({ ...gameState, wolvesTargetId: targetId });
+    // Update target but DO NOT reset timer
+    const newState = { ...gameState, wolvesTargetId: targetId };
+    updateAndBroadcast(newState);
   };
 
   const confirmWolfAction = () => {
+    // This is now triggered automatically by timer or manually by host
+    // But since host manual confirmation is removed/deprecated for automatic flow, we rely on Timer mostly
+    // or we can keep the button for "Early Finish".
     if (!isHost) return;
+    
     let nextStep: NightStep = NightStep.SEER_ACTION;
     
     if (!gameState.config.roleCounts[Role.SEER]) {
@@ -453,7 +497,12 @@ const App: React.FC = () => {
           ? "狼人请闭眼。预言家请睁眼，请输入座位号查验身份..." 
           : "狼人请闭眼。女巫请睁眼...");
 
-    const newState = { ...gameState, nightStep: nextStep, currentStory: story };
+    const newState = { 
+        ...gameState, 
+        nightStep: nextStep, 
+        currentStory: story,
+        timeLeft: nextStep === NightStep.NONE ? 0 : ACTION_TIMEOUT_SECONDS // Reset timer for next role
+    };
     updateAndBroadcast(newState);
     if (nextStep === NightStep.NONE) resolveNight(newState);
   };
@@ -478,7 +527,8 @@ const App: React.FC = () => {
       const newState = {
           ...gameState,
           nightStep: nextStep,
-          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼..."
+          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼...",
+          timeLeft: nextStep === NightStep.NONE ? 0 : ACTION_TIMEOUT_SECONDS
       };
       updateAndBroadcast(newState);
       if (nextStep === NightStep.NONE) resolveNight(newState);
@@ -505,7 +555,8 @@ const App: React.FC = () => {
           witchSaveUsed: gameState.witchAction.save ? true : gameState.witchSaveUsed,
           witchPoisonUsed: gameState.witchAction.poisonTargetId !== null ? true : gameState.witchPoisonUsed,
           nightStep: NightStep.NONE,
-          currentStory: "女巫请闭眼。天亮了..."
+          currentStory: "女巫请闭眼。天亮了...",
+          timeLeft: 0
       };
       updateAndBroadcast(newState);
       resolveNight(newState);
@@ -525,7 +576,6 @@ const App: React.FC = () => {
           return {
               ...p,
               isAlive: died ? false : p.isAlive,
-              // Grant Last Words if it's Round 1 and they died
               hasLastWords: died && currentState.round === 1 ? true : p.hasLastWords
           };
       });
@@ -533,7 +583,6 @@ const App: React.FC = () => {
       const hunter = updatedPlayers.find(p => p.role === Role.HUNTER);
       const hunterDied = hunter && deadIds.includes(hunter.id);
       const hunterPoisoned = hunter && witchAction.poisonTargetId === hunter.id;
-      // Hunter shoots if dead and NOT poisoned
       const canHunterShoot = hunterDied && !hunterPoisoned;
 
       const nextPhase = canHunterShoot ? Phase.NIGHT : Phase.DAY_TRANSITION;
@@ -545,7 +594,8 @@ const App: React.FC = () => {
           lastNightDeadIds: deadIds,
           phase: nextPhase,
           nightStep: nextNightStep,
-          isLoadingStory: true
+          isLoadingStory: true,
+          timeLeft: canHunterShoot ? ACTION_TIMEOUT_SECONDS : 0
       };
       
       updateAndBroadcast(newState);
@@ -581,7 +631,29 @@ const App: React.FC = () => {
 
   const confirmHunterAction = () => {
      if (!isHost) return;
-     if (gameState.hunterTargetId === null) return;
+     // If timer expires and no target selected, Hunter dies without shooting
+     if (gameState.hunterTargetId === null) {
+          // Hunter forfeit
+          const newState = {
+            ...gameState,
+            phase: Phase.DAY_TRANSITION,
+            nightStep: NightStep.NONE,
+            timeLeft: 0,
+            isLoadingStory: true
+          };
+          updateAndBroadcast(newState);
+          setTimeout(async () => {
+             // Basic story without hunter kill
+             const story = await generateNightStory(newState.round, gameState.players.filter(p => gameState.lastNightDeadIds.includes(p.id)), gameState.players);
+             updateAndBroadcast({
+                 ...newState,
+                 currentStory: story,
+                 storyLog: [...newState.storyLog, `第 ${newState.round} 夜: ${story}`],
+                 isLoadingStory: false
+             });
+          }, 100);
+          return;
+     }
      
      const newDeadId = gameState.hunterTargetId;
      const updatedPlayers = gameState.players.map(p => ({
@@ -595,7 +667,8 @@ const App: React.FC = () => {
          lastNightDeadIds: [...gameState.lastNightDeadIds, newDeadId],
          phase: Phase.DAY_TRANSITION,
          nightStep: NightStep.NONE,
-         isLoadingStory: true
+         isLoadingStory: true,
+         timeLeft: 0
      };
      updateAndBroadcast(newState);
      
@@ -682,7 +755,7 @@ const App: React.FC = () => {
           if (exiledPlayer?.role === Role.HUNTER) {
              // Delay slightly to let story update
              setTimeout(() => {
-                 updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null, currentStory: "猎人被放逐，请开枪。" });
+                 updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null, currentStory: "猎人被放逐，请开枪。", timeLeft: ACTION_TIMEOUT_SECONDS });
              }, 3000);
           } else {
              setTimeout(() => {
@@ -842,9 +915,6 @@ const App: React.FC = () => {
                 <input 
                     className="flex-1 bg-slate-800 rounded px-2 py-1 text-sm outline-none border border-slate-700 focus:border-indigo-500 disabled:opacity-50"
                     value={type === 'public' && appMode === 'GAME' ? chatInput : chatInput} 
-                    // Note: We are using same state 'chatInput' for both. 
-                    // In a real app, might want separate states if both visible at once.
-                    // Here, usually only one is prominent or we just clear on switch.
                     onChange={e => setChatInput(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && canSpeak && sendChatMessage(type)}
                     placeholder={placeholder}
@@ -873,14 +943,24 @@ const App: React.FC = () => {
      const isWitchTurn = isNight && gameState.nightStep === NightStep.WITCH_ACTION && me?.role === Role.WITCH && me.isAlive;
      const isHunterTurn = (isNight || gameState.phase === Phase.NIGHT) && gameState.nightStep === NightStep.HUNTER_ACTION && me?.role === Role.HUNTER; // Hunter acts when dead in this phase
      const isVoting = gameState.phase === Phase.VOTING && me?.isAlive;
+     
+     // Countdown Display
+     const showTimer = isNight && gameState.nightStep !== NightStep.NONE;
 
      return (
          <div className="flex flex-col h-full max-w-4xl mx-auto p-4 space-y-4">
             <div className="flex justify-between items-center relative">
                  <Button variant="secondary" onClick={leaveRoom} className="text-xs absolute left-0">退出</Button>
                  <div className="w-full text-center">
-                    <div className="inline-block bg-indigo-900/50 px-3 py-1 rounded-full text-xs font-bold mb-2">
-                        第 {gameState.round} 天 - {isNight ? "黑夜" : "白天"}
+                    <div className="flex flex-col items-center mb-2">
+                        <div className="inline-block bg-indigo-900/50 px-3 py-1 rounded-full text-xs font-bold mb-1">
+                            第 {gameState.round} 天 - {isNight ? "黑夜" : "白天"}
+                        </div>
+                        {showTimer && (
+                            <div className={`text-xl font-mono font-bold ${gameState.timeLeft <= 5 ? 'text-red-500 animate-pulse' : 'text-amber-400'}`}>
+                                ⏰ {gameState.timeLeft}s
+                            </div>
+                        )}
                     </div>
                     <h2 className="text-xl font-bold text-slate-100 px-12 line-clamp-2">{gameState.currentStory}</h2>
                  </div>
@@ -888,27 +968,47 @@ const App: React.FC = () => {
              
              {/* Main Grid */}
              <div className="grid grid-cols-3 md:grid-cols-4 gap-3 flex-grow overflow-y-auto pb-4 content-start">
-                 {gameState.players.map(p => (
-                     <PlayerCard
-                        key={p.id}
-                        player={p}
-                        isMe={p.id === myPlayerId}
-                        revealed={
-                            p.id === myPlayerId || 
-                            (!p.isAlive) || 
-                            (me?.role === Role.WEREWOLF && p.role === Role.WEREWOLF)
-                        }
-                        selected={
-                            gameState.wolvesTargetId === p.id ||
-                            gameState.witchAction.poisonTargetId === p.id ||
-                            gameState.hunterTargetId === p.id
-                        }
-                        // No onClick logic on cards anymore
-                     />
-                 ))}
+                 {gameState.players.map(p => {
+                     // Privacy Logic: Only show 'selected' border if I am the role that selected this player
+                     let isSelected = false;
+                     if (isWolfTurn && p.id === gameState.wolvesTargetId) isSelected = true;
+                     if (isSeerTurn && p.id === gameState.seerCheckId) isSelected = true;
+                     if (isWitchTurn && p.id === gameState.witchAction.poisonTargetId) isSelected = true;
+                     if (isHunterTurn && p.id === gameState.hunterTargetId) isSelected = true;
+                     
+                     // Vote counting logic
+                     const votesReceived = Object.entries(gameState.currentVotes)
+                        .filter(([_, target]) => (target as number) === p.id)
+                        .map(([voterId]) => parseInt(voterId) + 1); // 1-indexed
+
+                     return (
+                         <div key={p.id} className="relative">
+                            <PlayerCard
+                                player={p}
+                                isMe={p.id === myPlayerId}
+                                revealed={
+                                    p.id === myPlayerId || 
+                                    (!p.isAlive) || 
+                                    (me?.role === Role.WEREWOLF && p.role === Role.WEREWOLF)
+                                }
+                                selected={isSelected}
+                            />
+                            {/* Vote Badges */}
+                            {votesReceived.length > 0 && (
+                                <div className="absolute -bottom-2 left-1/2 -translate-x-1/2 flex gap-1 z-20">
+                                    {votesReceived.map(voterSeat => (
+                                        <div key={voterSeat} className="bg-amber-500 text-slate-900 text-[10px] w-4 h-4 rounded-full flex items-center justify-center font-bold shadow-sm border border-white">
+                                            {voterSeat}
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                         </div>
+                     );
+                 })}
              </div>
 
-             {/* Voting Results Overlay (if voting phase over or showing votes) */}
+             {/* Voting Results Overlay */}
              {isVoting && (
                  <div className="text-center text-xs text-amber-500">
                      正在投票... 票数将在结果公布时揭晓
@@ -1050,12 +1150,9 @@ const App: React.FC = () => {
                  {/* Host Controls */}
                  {isHost && isNight && gameState.nightStep !== NightStep.NONE && (
                      <Button fullWidth onClick={() => {
-                        if (gameState.nightStep === NightStep.WEREWOLF_ACTION) confirmWolfAction();
-                        else if (gameState.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
-                        else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
-                        else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
+                        handleTimerExpire(); // Manually trigger early
                      }} className="mt-4 border-t border-slate-600 pt-2">
-                         法官：确认并继续
+                         法官：立即结束本环节
                      </Button>
                  )}
                  {isHost && gameState.phase === Phase.DAY_TRANSITION && (

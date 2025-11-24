@@ -59,6 +59,7 @@ export interface GameState {
   round: number;
   players: Player[];
   nightStep: NightStep;
+  timeLeft: number; // Countdown timer for current action
   
   // Action Tracking
   wolvesTargetId: number | null;
