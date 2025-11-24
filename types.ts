@@ -1,3 +1,4 @@
+
 export enum Role {
   WEREWOLF = '狼人',
   VILLAGER = '村民',
@@ -8,7 +9,7 @@ export enum Role {
 
 export enum Phase {
   SETUP = 'SETUP',
-  LOBBY = 'LOBBY', // New phase for network lobby
+  LOBBY = 'LOBBY',
   ROLE_REVEAL = 'ROLE_REVEAL',
   NIGHT = 'NIGHT',
   DAY_TRANSITION = 'DAY_TRANSITION',
@@ -43,6 +44,7 @@ export interface GameConfig {
 
 export interface GameState {
   mode: number; // Player count
+  config: GameConfig; // Store the full config
   phase: Phase;
   round: number;
   players: Player[];

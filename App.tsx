@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Peer, DataConnection } from 'peerjs';
-import { GameState, Phase, Role, Player, NightStep, GameConfig, NetworkMessage } from './types';
+import { GameState, Phase, Role, Player, NightStep, GameConfig, NetworkMessage, DEFAULT_ROLES_6 } from './types';
 import { PlayerCard } from './components/PlayerCard';
 import { Button } from './components/Button';
 import { GameSetup } from './components/GameSetup';
@@ -11,6 +11,7 @@ import { speak, stopSpeech } from './services/ttsService';
 // Initial State Factory
 const createInitialState = (): GameState => ({
   mode: 6,
+  config: { totalPlayers: 6, roleCounts: DEFAULT_ROLES_6 },
   phase: Phase.SETUP,
   round: 0,
   players: [],
@@ -72,6 +73,10 @@ const App: React.FC = () => {
     return () => stopSpeech();
   }, []);
 
+  // --- Networking: Message Handler Ref Pattern ---
+  // This ref always holds the latest version of the handler to avoid stale closures in PeerJS listeners
+  const handleNetworkMessageRef = useRef<(msg: NetworkMessage, conn?: DataConnection) => void>(() => {});
+
   // --- Networking: Initialization ---
   useEffect(() => {
     const peer = new Peer();
@@ -81,9 +86,23 @@ const App: React.FC = () => {
       console.log('My Peer ID:', id);
     });
 
+    peer.on('error', (err) => {
+      console.error("PeerJS Error:", err);
+      if (err.type === 'peer-unavailable') {
+         alert("房间不存在或 ID 错误");
+         setAppMode('MENU');
+      }
+    });
+
     peer.on('connection', (conn) => {
-      // Logic for Host receiving connections
-      conn.on('data', (data) => handleNetworkMessage(data as NetworkMessage, conn));
+      // Host Logic: Receiving a connection
+      conn.on('data', (data) => {
+        // Use the ref to ensure we have latest state (isHost, etc)
+        if (handleNetworkMessageRef.current) {
+           handleNetworkMessageRef.current(data as NetworkMessage, conn);
+        }
+      });
+
       conn.on('open', () => {
         // Add to connections list if host
         if (connectionsRef.current) {
@@ -104,11 +123,14 @@ const App: React.FC = () => {
 
   // --- Network Message Handling ---
   const handleNetworkMessage = (msg: NetworkMessage, conn?: DataConnection) => {
-    // console.log("Received Msg:", msg);
+    // console.log("Received Msg:", msg, "Am I Host?", isHost);
     
     if (msg.type === 'JOIN') {
       // Host receives JOIN
-      if (!isHost) return; // Should not happen
+      if (!isHost) {
+        console.warn("Received JOIN but I am not host. State issue?");
+        return;
+      }
       
       const newPlayerId = gameState.players.length;
       const newPlayer: Player = {
@@ -160,6 +182,11 @@ const App: React.FC = () => {
       handleClientAction(msg.payload.action, msg.payload.data, msg.payload.fromPlayerId);
     }
   };
+
+  // Keep the ref updated on every render
+  useEffect(() => {
+    handleNetworkMessageRef.current = handleNetworkMessage;
+  });
 
   const broadcastState = (newState: GameState) => {
     // In a real app, we should scrub secret info (roles) for clients
@@ -220,6 +247,7 @@ const App: React.FC = () => {
     setGameState({
       ...createInitialState(),
       mode: config.totalPlayers,
+      config: config, // Persist config
       phase: Phase.LOBBY,
       players: [hostPlayer],
       roomId: peerId
@@ -239,7 +267,15 @@ const App: React.FC = () => {
       });
     });
 
-    conn?.on('data', (data) => handleNetworkMessage(data as NetworkMessage));
+    conn?.on('data', (data) => {
+        if (handleNetworkMessageRef.current) {
+            handleNetworkMessageRef.current(data as NetworkMessage, conn);
+        }
+    });
+    conn?.on('error', (err) => {
+        alert("连接失败: " + err);
+        setAppMode('MENU');
+    });
     conn?.on('close', () => alert("Disconnected from host"));
     
     setAppMode('JOIN'); // Wait for Welcome
@@ -248,20 +284,16 @@ const App: React.FC = () => {
   const startGame = () => {
     if (!isHost) return;
     
-    const count = gameState.players.length;
-    // Default fallback
+    // Distribute roles based on Config
     const roles: Role[] = [];
-    // Just fill with villagers first
-    for(let i=0; i<count; i++) roles.push(Role.VILLAGER);
+    Object.entries(gameState.config.roleCounts).forEach(([role, count]) => {
+      for(let i=0; i<(count as number); i++) roles.push(role as Role);
+    });
     
-    // Assign Wolves (approx 1/3)
-    const wolves = Math.max(2, Math.floor(count / 3));
-    for(let i=0; i<wolves; i++) roles[i] = Role.WEREWOLF;
-    
-    // Assign Gods
-    roles[wolves] = Role.SEER;
-    roles[wolves+1] = Role.HUNTER;
-    if (count >= 8) roles[wolves+2] = Role.WITCH;
+    // Safety check: fill with Villagers if something is wrong
+    while(roles.length < gameState.players.length) {
+      roles.push(Role.VILLAGER);
+    }
     
     // Shuffle
     for (let i = roles.length - 1; i > 0; i--) {
@@ -271,7 +303,7 @@ const App: React.FC = () => {
 
     const newPlayers = gameState.players.map((p, i) => ({
       ...p,
-      role: roles[i]
+      role: roles[i] || Role.VILLAGER
     }));
 
     const newState = {
@@ -286,7 +318,7 @@ const App: React.FC = () => {
     broadcastState(newState);
   };
 
-  // --- Game Logic Methods (Similar to original, adapted for Host) ---
+  // --- Game Logic Methods ---
   
   const startNight = () => {
     const newState = {
@@ -297,7 +329,7 @@ const App: React.FC = () => {
       wolvesTargetId: null,
       seerCheckId: null,
       witchAction: { save: false, poisonTargetId: null },
-      currentStory: "天黑请闭眼。狼人请睁眼..."
+      currentStory: "天黑请闭眼。狼人请睁眼，请确认你们的袭击目标..."
     };
     updateAndBroadcast(newState);
   };
@@ -318,20 +350,29 @@ const App: React.FC = () => {
 
   const confirmWolfAction = () => {
     if (!isHost) return;
-    let nextStep = NightStep.SEER_ACTION;
-    const seer = gameState.players.find(p => p.role === Role.SEER);
-    if (!seer?.isAlive) nextStep = gameState.mode >= 8 ? NightStep.WITCH_ACTION : NightStep.NONE;
+    let nextStep: NightStep = NightStep.SEER_ACTION;
+    
+    // Check if Seer exists
+    if (!gameState.config.roleCounts[Role.SEER]) {
+       nextStep = NightStep.WITCH_ACTION;
+    }
+
+    // Check if Witch exists (if we are skipping Seer or Seer is done)
+    // Note: This logic assumes if we skip Seer, we check Witch.
+    if (nextStep === NightStep.WITCH_ACTION && !gameState.config.roleCounts[Role.WITCH]) {
+        nextStep = NightStep.NONE;
+    }
 
     const newState = {
       ...gameState,
       nightStep: nextStep,
       currentStory: nextStep === NightStep.NONE 
         ? "天亮了..." 
-        : (nextStep === NightStep.SEER_ACTION ? "预言家请睁眼..." : "女巫请睁眼...")
+        : (nextStep === NightStep.SEER_ACTION ? "狼人请闭眼。预言家请睁眼，你要查验谁的身份？" : "狼人请闭眼。女巫请睁眼...")
     };
     
     updateAndBroadcast(newState);
-    if (nextStep === NightStep.NONE && gameState.mode < 8) resolveNight(newState);
+    if (nextStep === NightStep.NONE) resolveNight(newState);
   };
   
   const handleSeerCheck = (targetId: number) => {
@@ -345,17 +386,16 @@ const App: React.FC = () => {
 
   const confirmSeerAction = () => {
       if (!isHost) return;
-      let nextStep = gameState.mode >= 8 ? NightStep.WITCH_ACTION : NightStep.NONE;
-      // Check Witch
-      if (gameState.mode >= 8) {
-          const witch = gameState.players.find(p => p.role === Role.WITCH);
-          if (!witch?.isAlive) nextStep = NightStep.NONE;
+      let nextStep = NightStep.WITCH_ACTION;
+      
+      if (!gameState.config.roleCounts[Role.WITCH]) {
+          nextStep = NightStep.NONE;
       }
 
       const newState = {
           ...gameState,
           nightStep: nextStep,
-          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "女巫请睁眼..."
+          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼，你有一瓶毒药和一瓶解药..."
       };
       updateAndBroadcast(newState);
       if (nextStep === NightStep.NONE) resolveNight(newState);
@@ -405,6 +445,7 @@ const App: React.FC = () => {
       const hunter = updatedPlayers.find(p => p.role === Role.HUNTER);
       const hunterDied = hunter && deadIds.includes(hunter.id);
       const hunterPoisoned = hunter && witchAction.poisonTargetId === hunter.id;
+      // Hunter can shoot if died by wolf (not poisoned)
       const canHunterShoot = hunterDied && !hunterPoisoned;
 
       const nextPhase = canHunterShoot ? Phase.NIGHT : Phase.DAY_TRANSITION;
@@ -432,6 +473,12 @@ const App: React.FC = () => {
               isLoadingStory: false
           };
           updateAndBroadcast(storyState);
+      } else if (canHunterShoot) {
+          updateAndBroadcast({
+              ...newState,
+              currentStory: "猎人请睁眼。你已倒牌，请选择开枪带走的目标...",
+              isLoadingStory: false
+          });
       }
   };
 
@@ -521,9 +568,9 @@ const App: React.FC = () => {
           updateAndBroadcast({
               ...gameState,
               storyLog: [...gameState.storyLog, "投票平局，无人放逐。"],
-              currentStory: "平安日，无人被放逐。"
+              currentStory: "投票平局，无人被放逐。天又要黑了..."
           });
-          setTimeout(() => startNight(), 3000);
+          setTimeout(() => startNight(), 4000);
       } else {
           const updatedPlayers = gameState.players.map(p => ({
               ...p,
@@ -540,7 +587,7 @@ const App: React.FC = () => {
           updateAndBroadcast(newState);
           
           if (exiledPlayer?.role === Role.HUNTER) {
-             updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null });
+             updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null, currentStory: "猎人被放逐，请开枪。" });
           } else {
              setTimeout(() => {
                  const wolves = updatedPlayers.filter(p => p.isAlive && p.role === Role.WEREWOLF);
@@ -548,7 +595,7 @@ const App: React.FC = () => {
                  if (wolves.length === 0) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'VILLAGERS' });
                  else if (wolves.length >= good.length) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'WEREWOLVES' });
                  else startNight();
-             }, 3000);
+             }, 4000);
           }
       }
   };
@@ -702,7 +749,7 @@ const App: React.FC = () => {
                         // Reveal role ONLY if it's me OR I am a wolf and they are a wolf
                         revealed={
                             p.id === myPlayerId || 
-                            (!p.isAlive) || // Reveal dead? Usually no, but for this app yes
+                            (!p.isAlive) || // Reveal dead
                             (me?.role === Role.WEREWOLF && p.role === Role.WEREWOLF)
                         }
                         selectable={canAct && p.isAlive}
@@ -753,7 +800,7 @@ const App: React.FC = () => {
                         else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
                         else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
                      }}>
-                         确认行动 (法官)
+                         法官：确认并继续
                      </Button>
                  )}
                  
@@ -782,7 +829,7 @@ const App: React.FC = () => {
        <main className="flex-grow overflow-y-auto">
           {appMode === 'MENU' && renderMenu()}
           {appMode === 'SETUP' && <GameSetup onStart={createRoom} onBack={() => setAppMode('MENU')} />}
-          {appMode === 'JOIN' && <div className="text-center p-10">正在加入房间...</div>}
+          {appMode === 'JOIN' && <div className="text-center p-10">正在加入房间...<br/><span className="text-xs text-slate-500 mt-2">若长时间无反应，请检查房间 ID 是否正确</span></div>}
           {appMode === 'LOBBY' && renderLobby()}
           {appMode === 'GAME' && (
               gameState.phase === Phase.ROLE_REVEAL ? renderRoleReveal() :
@@ -799,7 +846,7 @@ const App: React.FC = () => {
        {appMode === 'GAME' && gameState.phase !== Phase.ROLE_REVEAL && (
            <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto" ref={scrollRef}>
                {gameState.storyLog.map((log, idx) => (
-                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono"> {log}</p>
+                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono">> {log}</p>
                ))}
            </div>
        )}
