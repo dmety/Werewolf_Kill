@@ -347,6 +347,16 @@ const App: React.FC = () => {
       }
   };
 
+  // --- Victory Logic ---
+  const checkWinCondition = (players: Player[]): { winner: 'WEREWOLVES' | 'VILLAGERS' | null } => {
+    const wolvesCount = players.filter(p => p.isAlive && p.role === Role.WEREWOLF).length;
+    const goodCount = players.filter(p => p.isAlive && p.role !== Role.WEREWOLF).length;
+
+    if (wolvesCount === 0) return { winner: 'VILLAGERS' };
+    if (goodCount === 0 || wolvesCount >= goodCount) return { winner: 'WEREWOLVES' };
+    return { winner: null };
+  };
+
   // --- Host Logic: Client Action Handler ---
   const handleClientAction = (action: string, data: any, fromId: number) => {
     // Actions are processed by Host using Latest Ref State
@@ -604,12 +614,33 @@ const App: React.FC = () => {
           };
       });
 
+      // --- Victory Check Point 1: After Night Deaths ---
+      const { winner } = checkWinCondition(updatedPlayers);
+      
+      // Special Case: Hunter Check
       const hunter = updatedPlayers.find(p => p.role === Role.HUNTER);
       const hunterDied = hunter && deadIds.includes(hunter.id);
       const hunterPoisoned = hunter && witchAction.poisonTargetId === hunter.id;
       const canHunterShoot = hunterDied && !hunterPoisoned;
 
-      const nextPhase = canHunterShoot ? Phase.NIGHT : Phase.DAY_TRANSITION;
+      // If Good wins immediately (Wolves dead), end game.
+      // If Wolves win (Good dead), check if Hunter can shoot first to force a draw/turnaround.
+      // But if Good wins, game over.
+      if (winner === 'VILLAGERS') {
+          updateAndBroadcast({
+              ...currentState,
+              players: updatedPlayers,
+              phase: Phase.GAME_OVER,
+              winner: 'VILLAGERS',
+              lastNightDeadIds: deadIds,
+              timeLeft: 0,
+              storyLog: [...currentState.storyLog, `第 ${currentState.round} 夜结束，好人胜利！`]
+          });
+          return;
+      }
+
+      // If Hunter shoots, prioritize Hunter Action over immediate Wolf Victory (unless Good already won)
+      const nextPhase = canHunterShoot ? Phase.NIGHT : (winner ? Phase.GAME_OVER : Phase.DAY_TRANSITION);
       const nextNightStep = canHunterShoot ? NightStep.HUNTER_ACTION : NightStep.NONE;
 
       const newState = {
@@ -618,11 +649,22 @@ const App: React.FC = () => {
           lastNightDeadIds: deadIds,
           phase: nextPhase,
           nightStep: nextNightStep,
+          winner: winner || null,
           isLoadingStory: true,
           timeLeft: canHunterShoot ? ACTION_TIMEOUT_SECONDS : 0
       };
       
       updateAndBroadcast(newState);
+
+      if (nextPhase === Phase.GAME_OVER) {
+          // Game Over (Wolf Win) and Hunter cannot shoot
+          updateAndBroadcast({
+              ...newState,
+              isLoadingStory: false,
+              storyLog: [...newState.storyLog, `第 ${newState.round} 夜结束，游戏结束！`]
+          });
+          return;
+      }
 
       if (nextPhase === Phase.DAY_TRANSITION) {
           const deadPlayers = updatedPlayers.filter(p => deadIds.includes(p.id));
@@ -658,8 +700,15 @@ const App: React.FC = () => {
      if (!isHost) return;
      const current = gameStateRef.current;
      
+     // Fallback if hunter times out without shooting
      if (current.hunterTargetId === null) {
-          // Hunter forfeit
+          // Check victory again just in case logic fell through
+          const { winner } = checkWinCondition(current.players);
+          if (winner) {
+               updateAndBroadcast({ ...current, phase: Phase.GAME_OVER, winner });
+               return;
+          }
+
           const newState = {
             ...current,
             phase: Phase.DAY_TRANSITION,
@@ -686,17 +735,26 @@ const App: React.FC = () => {
          isAlive: p.id === newDeadId ? false : p.isAlive
      }));
      
+     // --- Victory Check Point 2: After Hunter Shot ---
+     const { winner } = checkWinCondition(updatedPlayers);
+
      const newState = {
          ...current,
          players: updatedPlayers,
          lastNightDeadIds: [...current.lastNightDeadIds, newDeadId],
-         phase: Phase.DAY_TRANSITION,
+         phase: winner ? Phase.GAME_OVER : Phase.DAY_TRANSITION,
          nightStep: NightStep.NONE,
+         winner: winner,
          isLoadingStory: true,
          timeLeft: 0
      };
      updateAndBroadcast(newState);
      
+     if (winner) {
+         updateAndBroadcast({ ...newState, isLoadingStory: false, storyLog: [...newState.storyLog, `猎人带走了 ${newDeadId+1}号，游戏结束！`] });
+         return;
+     }
+
      setTimeout(async () => {
          const story = await generateNightStory(newState.round, updatedPlayers.filter(p => newState.lastNightDeadIds.includes(p.id) || p.id === newDeadId), updatedPlayers);
          updateAndBroadcast({
@@ -784,14 +842,25 @@ const App: React.FC = () => {
           }));
           const exiledPlayer = current.players.find(p => p.id === exiledId);
           
+          // --- Victory Check Point 3: After Voting Exile ---
+          const { winner } = checkWinCondition(updatedPlayers);
+
           const newState = {
               ...current,
               players: updatedPlayers,
               storyLog: [...current.storyLog, statsText, `${exiledPlayer?.name} 被放逐。`],
-              currentStory: `${exiledPlayer?.name} 被投票放逐了。请发表遗言。`
+              currentStory: `${exiledPlayer?.name} 被投票放逐了。请发表遗言。`,
+              winner: winner
           };
           updateAndBroadcast(newState);
           
+          if (winner) {
+             setTimeout(() => {
+                 updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER });
+             }, 3000);
+             return;
+          }
+
           if (exiledPlayer?.role === Role.HUNTER) {
              // Delay slightly to let story update
              setTimeout(() => {
@@ -799,11 +868,7 @@ const App: React.FC = () => {
              }, 3000);
           } else {
              setTimeout(() => {
-                 const wolves = updatedPlayers.filter(p => p.isAlive && p.role === Role.WEREWOLF);
-                 const good = updatedPlayers.filter(p => p.isAlive && p.role !== Role.WEREWOLF);
-                 if (wolves.length === 0) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'VILLAGERS' });
-                 else if (wolves.length >= good.length) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'WEREWOLVES' });
-                 else startNight();
+                 startNight();
              }, 8000); // Longer wait for last words time
           }
       }
@@ -1248,6 +1313,11 @@ const App: React.FC = () => {
               gameState.phase === Phase.GAME_OVER ? 
                 <div className="text-center p-10 flex flex-col items-center justify-center h-full">
                     <h1 className="text-4xl font-bold mb-4">{gameState.winner === 'WEREWOLVES' ? '🐺 狼人胜利' : '🧑‍🌾 好人胜利'}</h1>
+                    <div className="mb-8 text-slate-400">
+                       {gameState.players.map(p => (
+                           <div key={p.id} className="mb-1">{p.id+1}号 {p.name} - {p.role}</div>
+                       ))}
+                    </div>
                     <Button className="mt-4" onClick={leaveRoom}>返回首页</Button>
                 </div> 
                 : renderGame()
@@ -1258,11 +1328,7 @@ const App: React.FC = () => {
        {appMode === 'GAME' && gameState.phase !== Phase.ROLE_REVEAL && (
            <div className="border-t border-slate-800 bg-slate-900 p-2 max-h-32 overflow-y-auto flex-shrink-0" ref={scrollRef}>
                {gameState.storyLog.map((log, idx) => (
-<<<<<<< HEAD
-                   <p key={idx} className="text-xs text-slate-400 mb-1 font-mono"> {log}</p>
-=======
                    <p key={idx} className={`text-xs mb-1 font-mono ${log.includes('📊') ? 'text-amber-400 font-bold' : 'text-slate-400'}`}>{log}</p>
->>>>>>> 0b10c15804a2c5386d72569ed68f101be8c5b2ee
                ))}
            </div>
        )}
