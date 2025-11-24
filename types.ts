@@ -35,6 +35,7 @@ export interface Player {
   isProtected?: boolean;
   peerId?: string; // Network ID
   isHost?: boolean;
+  hasLastWords?: boolean; // Can speak once after death
 }
 
 export interface GameConfig {
@@ -48,6 +49,7 @@ export interface ChatMessage {
   senderName: string;
   text: string;
   timestamp: number;
+  isSystem?: boolean;
 }
 
 export interface GameState {
@@ -69,6 +71,7 @@ export interface GameState {
   // Voting & Chat
   currentVotes: Record<number, number>; // voterId -> targetId
   wolfChatHistory: ChatMessage[];
+  publicChatHistory: ChatMessage[];
 
   lastNightDeadIds: number[];
   winner: 'WEREWOLVES' | 'VILLAGERS' | null;
@@ -87,7 +90,7 @@ export type NetworkMessage =
   | { type: 'WELCOME'; payload: { playerId: number; gameState: GameState } }
   | { type: 'STATE_UPDATE'; payload: { gameState: GameState } }
   | { type: 'ACTION'; payload: { action: string; data: any; fromPlayerId: number } }
-  | { type: 'CHAT'; payload: { message: ChatMessage } };
+  | { type: 'CHAT'; payload: { message: ChatMessage; channel: 'public' | 'wolf' } };
 
 export const DEFAULT_ROLES_6: Record<Role, number> = {
   [Role.WEREWOLF]: 2,

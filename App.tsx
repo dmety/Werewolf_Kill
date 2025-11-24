@@ -24,6 +24,7 @@ const createInitialState = (): GameState => ({
   hunterTargetId: null,
   currentVotes: {},
   wolfChatHistory: [],
+  publicChatHistory: [],
   lastNightDeadIds: [],
   winner: null,
   storyLog: [],
@@ -52,8 +53,10 @@ const App: React.FC = () => {
   // --- Helper State ---
   const [isMuted, setIsMuted] = useState(false); // TTS Mute toggle
   const [chatInput, setChatInput] = useState('');
+  const [targetInput, setTargetInput] = useState(''); // Generic input for seat numbers
   const scrollRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const publicChatScrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -62,29 +65,34 @@ const App: React.FC = () => {
     }
   }, [gameState.storyLog, gameState.currentStory]);
 
-  // Auto-scroll chat
+  // Auto-scroll wolf chat
   useEffect(() => {
     if (chatScrollRef.current) {
         chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
   }, [gameState.wolfChatHistory]);
 
+  // Auto-scroll public chat
+  useEffect(() => {
+    if (publicChatScrollRef.current) {
+        publicChatScrollRef.current.scrollTop = publicChatScrollRef.current.scrollHeight;
+    }
+  }, [gameState.publicChatHistory, appMode]);
+
   // --- TTS Trigger ---
   useEffect(() => {
     // When currentStory changes, speak it if not muted
-    // We skip speaking during loading state or empty strings
     if (!isMuted && gameState.currentStory && !gameState.isLoadingStory) {
       speak(gameState.currentStory);
     }
   }, [gameState.currentStory, gameState.isLoadingStory, isMuted]);
 
-  // Stop speech when component unmounts or game over
+  // Stop speech when component unmounts
   useEffect(() => {
     return () => stopSpeech();
   }, []);
 
   // --- Networking: Message Handler Ref Pattern ---
-  // This ref always holds the latest version of the handler to avoid stale closures in PeerJS listeners
   const handleNetworkMessageRef = useRef<(msg: NetworkMessage, conn?: DataConnection) => void>(() => {});
 
   // --- Networking: Initialization ---
@@ -107,16 +115,12 @@ const App: React.FC = () => {
       });
   
       peer.on('connection', (conn) => {
-        // Host Logic: Receiving a connection
         conn.on('data', (data) => {
-          // Use the ref to ensure we have latest state (isHost, etc)
           if (handleNetworkMessageRef.current) {
              handleNetworkMessageRef.current(data as NetworkMessage, conn);
           }
         });
-  
         conn.on('open', () => {
-          // Add to connections list if host
           if (connectionsRef.current) {
               connectionsRef.current.push(conn);
           }
@@ -139,81 +143,61 @@ const App: React.FC = () => {
 
   // --- Network Message Handling ---
   const handleNetworkMessage = (msg: NetworkMessage, conn?: DataConnection) => {
-    // console.log("Received Msg:", msg, "Am I Host?", isHost);
-    
     if (msg.type === 'JOIN') {
-      // Host receives JOIN
-      if (!isHost) {
-        console.warn("Received JOIN but I am not host. State issue?");
-        return;
-      }
+      if (!isHost) return;
       
       const newPlayerId = gameState.players.length;
       const newPlayer: Player = {
         id: newPlayerId,
         name: msg.payload.name,
-        role: Role.VILLAGER, // Temporary, assigned on start
+        role: Role.VILLAGER, 
         isAlive: true,
         avatar: `https://picsum.photos/seed/${msg.payload.peerId}/200`,
-        peerId: msg.payload.peerId
+        peerId: msg.payload.peerId,
+        hasLastWords: false
       };
 
       const updatedPlayers = [...gameState.players, newPlayer];
-      
-      // Update local state (Host)
       const newState = { ...gameState, players: updatedPlayers };
       setGameState(newState);
 
-      // Send Welcome to new player
       conn?.send({
         type: 'WELCOME',
         payload: { playerId: newPlayerId, gameState: newState }
       } as NetworkMessage);
-
-      // Broadcast update to all others
       broadcastState(newState);
     }
 
     if (msg.type === 'WELCOME') {
-      // Client receives WELCOME
       setMyPlayerId(msg.payload.playerId);
       setGameState(msg.payload.gameState);
       setAppMode('LOBBY');
     }
 
     if (msg.type === 'STATE_UPDATE') {
-      // Client receives State Update
       setGameState(msg.payload.gameState);
-      // Determine if game started
       if (msg.payload.gameState.phase !== Phase.LOBBY && appMode === 'LOBBY') {
         setAppMode('GAME');
       }
     }
 
     if (msg.type === 'ACTION') {
-      // Host receives Action (Vote, Night Action)
       if (!isHost) return;
       handleClientAction(msg.payload.action, msg.payload.data, msg.payload.fromPlayerId);
     }
 
     if (msg.type === 'CHAT') {
-        // Only Host receives CHAT from clients, then broadcasts via state
         if (isHost) {
-            const newHistory = [...gameState.wolfChatHistory, msg.payload.message];
-            const newState = { ...gameState, wolfChatHistory: newHistory };
-            updateAndBroadcast(newState);
+            handleChat(msg.payload.message, msg.payload.channel);
         }
     }
   };
 
-  // Keep the ref updated on every render
   useEffect(() => {
     handleNetworkMessageRef.current = handleNetworkMessage;
   });
 
   const broadcastState = (newState: GameState) => {
-    // In a real app, we should scrub secret info (roles) for clients
-    // For this prototype, we send full state but client UI hides it.
     connectionsRef.current.forEach(conn => {
        conn.send({ type: 'STATE_UPDATE', payload: { gameState: newState } });
     });
@@ -230,56 +214,89 @@ const App: React.FC = () => {
     }
   };
 
-  const sendChatMessage = () => {
+  const sendChatMessage = (channel: 'public' | 'wolf' = 'public') => {
       if (!chatInput.trim()) return;
       
       const me = gameState.players.find(p => p.id === myPlayerId);
+      if (!me) return;
+
+      // Validation for "Last Words" consumption
+      let isLastWords = false;
+      if (!me.isAlive && channel === 'public') {
+          if (me.hasLastWords) {
+              isLastWords = true;
+          } else {
+              return; // Dead and no last words
+          }
+      }
+
       const msg: ChatMessage = {
           id: Date.now().toString() + Math.random(),
           senderId: myPlayerId!,
-          senderName: me?.name || 'Unknown',
+          senderName: me.name + (isLastWords ? ' (遗言)' : ''),
           text: chatInput,
           timestamp: Date.now()
       };
 
       if (isHost) {
-          const newState = { ...gameState, wolfChatHistory: [...gameState.wolfChatHistory, msg] };
-          updateAndBroadcast(newState);
+          handleChat(msg, channel);
+          // If host used last words, consume it locally
+          if (isLastWords) {
+              consumeLastWords(me.id);
+          }
       } else {
           hostConnRef.current?.send({
               type: 'CHAT',
-              payload: { message: msg }
+              payload: { message: msg, channel }
           });
+          // Client optimistically assumes message sent? No, rely on state update.
+          // But we need to tell Host to consume last words via the message or action?
+          // The host handles the consumption logic inside handleChat/updates
       }
       setChatInput('');
   };
 
+  const consumeLastWords = (playerId: number) => {
+      const updatedPlayers = gameState.players.map(p => 
+          p.id === playerId ? { ...p, hasLastWords: false } : p
+      );
+      updateAndBroadcast({ ...gameState, players: updatedPlayers });
+  };
+
+  const handleChat = (msg: ChatMessage, channel: 'public' | 'wolf') => {
+      let newState = { ...gameState };
+      
+      // Check if sender needs to lose last words
+      const sender = newState.players.find(p => p.id === msg.senderId);
+      if (sender && !sender.isAlive && sender.hasLastWords && channel === 'public') {
+          sender.hasLastWords = false; // Mutate local clone or map it
+          newState.players = newState.players.map(p => p.id === sender.id ? { ...p, hasLastWords: false } : p);
+      }
+
+      if (channel === 'wolf') {
+          newState.wolfChatHistory = [...newState.wolfChatHistory, msg];
+      } else {
+          newState.publicChatHistory = [...newState.publicChatHistory, msg];
+      }
+      updateAndBroadcast(newState);
+  };
+
   const leaveRoom = () => {
-      // Reset State
       setGameState(createInitialState());
       setAppMode('MENU');
       setMyPlayerId(null);
       setIsHost(false);
-      
-      // Close Connections
       connectionsRef.current.forEach(c => c.close());
       connectionsRef.current = [];
-      
       if (hostConnRef.current) {
           hostConnRef.current.close();
           hostConnRef.current = null;
       }
-
-      // Re-init peer to get a fresh ID if needed, or just keep same peer
-      // peerRef.current is usually fine to keep open, but let's just clear connections.
   };
 
   // --- Host Logic: Client Action Handler ---
   const handleClientAction = (action: string, data: any, fromId: number) => {
-    // console.log(`Action ${action} from ${fromId}`, data);
-    
     if (action === 'VOTE') {
-       // Update votes in GameState
        const newVotes = { ...gameState.currentVotes, [fromId]: data.targetId };
        const newState = { ...gameState, currentVotes: newVotes };
        updateAndBroadcast(newState);
@@ -304,17 +321,18 @@ const App: React.FC = () => {
     const hostPlayer: Player = {
       id: 0,
       name: playerName || "房主",
-      role: Role.VILLAGER, // Placeholder
+      role: Role.VILLAGER, 
       isAlive: true,
       avatar: `https://picsum.photos/seed/host/200`,
       peerId: peerId,
-      isHost: true
+      isHost: true,
+      hasLastWords: false
     };
 
     setGameState({
       ...createInitialState(),
       mode: config.totalPlayers,
-      config: config, // Persist config
+      config: config,
       phase: Phase.LOBBY,
       players: [hostPlayer],
       roomId: peerId
@@ -348,24 +366,21 @@ const App: React.FC = () => {
         leaveRoom();
     });
     
-    setAppMode('JOIN'); // Wait for Welcome
+    setAppMode('JOIN');
   };
 
   const startGame = () => {
     if (!isHost) return;
     
-    // Distribute roles based on Config
     const roles: Role[] = [];
     Object.entries(gameState.config.roleCounts).forEach(([role, count]) => {
       for(let i=0; i<(count as number); i++) roles.push(role as Role);
     });
     
-    // Safety check: fill with Villagers if something is wrong
     while(roles.length < gameState.players.length) {
       roles.push(Role.VILLAGER);
     }
     
-    // Shuffle
     for (let i = roles.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [roles[i], roles[j]] = [roles[j], roles[i]];
@@ -373,7 +388,8 @@ const App: React.FC = () => {
 
     const newPlayers = gameState.players.map((p, i) => ({
       ...p,
-      role: roles[i] || Role.VILLAGER
+      role: roles[i] || Role.VILLAGER,
+      hasLastWords: false
     }));
 
     const newState = {
@@ -388,7 +404,12 @@ const App: React.FC = () => {
     broadcastState(newState);
   };
 
-  // --- Game Logic Methods ---
+  const updateAndBroadcast = (newState: GameState) => {
+    setGameState(newState);
+    broadcastState(newState);
+  };
+
+  // --- Game Mechanics ---
   
   const startNight = () => {
     const newState = {
@@ -398,19 +419,12 @@ const App: React.FC = () => {
       nightStep: NightStep.WEREWOLF_ACTION,
       wolvesTargetId: null,
       seerCheckId: null,
-      // Witch potion usage persists across rounds, but action target resets
       witchAction: { save: false, poisonTargetId: null },
       hunterTargetId: null,
-      currentVotes: {}, // Clear votes
-      // wolfChatHistory: [], // Optional: Clear chat every night? Keeping history is usually better.
-      currentStory: "天黑请闭眼。狼人请睁眼，请确认你们的袭击目标..."
+      currentVotes: {},
+      currentStory: "天黑请闭眼。狼人请睁眼，请输入座位号袭击目标..."
     };
     updateAndBroadcast(newState);
-  };
-
-  const updateAndBroadcast = (newState: GameState) => {
-    setGameState(newState);
-    broadcastState(newState);
   };
   
   const handleWolfSelect = (targetId: number) => {
@@ -426,24 +440,20 @@ const App: React.FC = () => {
     if (!isHost) return;
     let nextStep: NightStep = NightStep.SEER_ACTION;
     
-    // Check if Seer exists
     if (!gameState.config.roleCounts[Role.SEER]) {
        nextStep = NightStep.WITCH_ACTION;
     }
-
-    // Check if Witch exists (if we are skipping Seer or Seer is done)
     if (nextStep === NightStep.WITCH_ACTION && !gameState.config.roleCounts[Role.WITCH]) {
         nextStep = NightStep.NONE;
     }
 
-    const newState = {
-      ...gameState,
-      nightStep: nextStep,
-      currentStory: nextStep === NightStep.NONE 
-        ? "天亮了..." 
-        : (nextStep === NightStep.SEER_ACTION ? "狼人请闭眼。预言家请睁眼，你要查验谁的身份？" : "狼人请闭眼。女巫请睁眼...")
-    };
-    
+    const story = nextStep === NightStep.NONE 
+      ? "天亮了..." 
+      : (nextStep === NightStep.SEER_ACTION 
+          ? "狼人请闭眼。预言家请睁眼，请输入座位号查验身份..." 
+          : "狼人请闭眼。女巫请睁眼...");
+
+    const newState = { ...gameState, nightStep: nextStep, currentStory: story };
     updateAndBroadcast(newState);
     if (nextStep === NightStep.NONE) resolveNight(newState);
   };
@@ -468,7 +478,7 @@ const App: React.FC = () => {
       const newState = {
           ...gameState,
           nightStep: nextStep,
-          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼，你有一瓶毒药和一瓶解药..."
+          currentStory: nextStep === NightStep.NONE ? "天亮了..." : "预言家请闭眼。女巫请睁眼..."
       };
       updateAndBroadcast(newState);
       if (nextStep === NightStep.NONE) resolveNight(newState);
@@ -495,7 +505,7 @@ const App: React.FC = () => {
           witchSaveUsed: gameState.witchAction.save ? true : gameState.witchSaveUsed,
           witchPoisonUsed: gameState.witchAction.poisonTargetId !== null ? true : gameState.witchPoisonUsed,
           nightStep: NightStep.NONE,
-          currentStory: "天亮了..."
+          currentStory: "女巫请闭眼。天亮了..."
       };
       updateAndBroadcast(newState);
       resolveNight(newState);
@@ -510,16 +520,20 @@ const App: React.FC = () => {
       
       deadIds = [...new Set(deadIds)];
       
-      const updatedPlayers = players.map(p => ({
-          ...p,
-          isAlive: deadIds.includes(p.id) ? false : p.isAlive
-      }));
+      const updatedPlayers = players.map(p => {
+          const died = deadIds.includes(p.id);
+          return {
+              ...p,
+              isAlive: died ? false : p.isAlive,
+              // Grant Last Words if it's Round 1 and they died
+              hasLastWords: died && currentState.round === 1 ? true : p.hasLastWords
+          };
+      });
 
       const hunter = updatedPlayers.find(p => p.role === Role.HUNTER);
       const hunterDied = hunter && deadIds.includes(hunter.id);
       const hunterPoisoned = hunter && witchAction.poisonTargetId === hunter.id;
-      // Hunter can shoot if died by wolf (not poisoned) or just regular death? 
-      // Traditional rules: Hunter cannot shoot if poisoned.
+      // Hunter shoots if dead and NOT poisoned
       const canHunterShoot = hunterDied && !hunterPoisoned;
 
       const nextPhase = canHunterShoot ? Phase.NIGHT : Phase.DAY_TRANSITION;
@@ -550,7 +564,7 @@ const App: React.FC = () => {
       } else if (canHunterShoot) {
           updateAndBroadcast({
               ...newState,
-              currentStory: "猎人请睁眼。你已倒牌，请选择开枪带走的目标...",
+              currentStory: "猎人请睁眼。你已倒牌，请输入座位号开枪带走一人...",
               isLoadingStory: false
           });
       }
@@ -615,16 +629,16 @@ const App: React.FC = () => {
         ...gameState, 
         currentVotes: {}, 
         phase: Phase.VOTING, 
-        currentStory: "请所有幸存玩家进行投票。" 
+        currentStory: "请所有幸存玩家输入座位号进行投票。" 
       });
   };
 
   const submitVotes = () => {
       if (!isHost) return;
-      // Calculate from GameState.currentVotes
       const voteCounts: Record<number, number> = {};
       Object.values(gameState.currentVotes).forEach(val => {
-          voteCounts[val] = (voteCounts[val] || 0) + 1;
+          const targetId = val as number;
+          voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
       });
 
       let maxVotes = 0;
@@ -652,7 +666,8 @@ const App: React.FC = () => {
       } else {
           const updatedPlayers = gameState.players.map(p => ({
               ...p,
-              isAlive: p.id === exiledId ? false : p.isAlive
+              isAlive: p.id === exiledId ? false : p.isAlive,
+              hasLastWords: p.id === exiledId ? true : p.hasLastWords // Exiled player gets Last Words
           }));
           const exiledPlayer = gameState.players.find(p => p.id === exiledId);
           
@@ -660,12 +675,15 @@ const App: React.FC = () => {
               ...gameState,
               players: updatedPlayers,
               storyLog: [...gameState.storyLog, `${exiledPlayer?.name} 被放逐。`],
-              currentStory: `${exiledPlayer?.name} 被投票放逐了。`
+              currentStory: `${exiledPlayer?.name} 被投票放逐了。请发表遗言。`
           };
           updateAndBroadcast(newState);
           
           if (exiledPlayer?.role === Role.HUNTER) {
-             updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null, currentStory: "猎人被放逐，请开枪。" });
+             // Delay slightly to let story update
+             setTimeout(() => {
+                 updateAndBroadcast({ ...newState, phase: Phase.NIGHT, nightStep: NightStep.HUNTER_ACTION, hunterTargetId: null, currentStory: "猎人被放逐，请开枪。" });
+             }, 3000);
           } else {
              setTimeout(() => {
                  const wolves = updatedPlayers.filter(p => p.isAlive && p.role === Role.WEREWOLF);
@@ -673,11 +691,28 @@ const App: React.FC = () => {
                  if (wolves.length === 0) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'VILLAGERS' });
                  else if (wolves.length >= good.length) updateAndBroadcast({ ...newState, phase: Phase.GAME_OVER, winner: 'WEREWOLVES' });
                  else startNight();
-             }, 4000);
+             }, 8000); // Longer wait for last words time
           }
       }
   };
 
+  // --- UI Helpers ---
+
+  const handleSeatInput = (action: (id: number) => void) => {
+    const seatNum = parseInt(targetInput);
+    if (isNaN(seatNum) || seatNum < 1 || seatNum > gameState.players.length) {
+        alert("请输入有效的座位号");
+        return;
+    }
+    const targetId = seatNum - 1;
+    // Basic check if target exists
+    if (!gameState.players[targetId]) {
+        alert("玩家不存在");
+        return;
+    }
+    action(targetId);
+    setTargetInput('');
+  };
 
   // --- Render Sections ---
 
@@ -713,7 +748,7 @@ const App: React.FC = () => {
           <div className="flex justify-between items-center">
              <Button variant="secondary" onClick={leaveRoom} className="text-sm">← 离开房间</Button>
              <h2 className="text-2xl font-bold text-slate-300">游戏大厅</h2>
-             <div className="w-20"></div> {/* Spacer */}
+             <div className="w-20"></div> 
           </div>
           
           <div className="text-center">
@@ -729,7 +764,8 @@ const App: React.FC = () => {
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               {gameState.players.map(p => (
-                  <div key={p.id} className="bg-slate-800 p-4 rounded-xl flex flex-col items-center">
+                  <div key={p.id} className="relative bg-slate-800 p-4 rounded-xl flex flex-col items-center">
+                      <div className="absolute top-2 left-2 bg-slate-700 text-white w-6 h-6 flex items-center justify-center rounded-full text-xs font-mono">{p.id + 1}</div>
                       <img src={p.avatar} className="w-16 h-16 rounded-full mb-2 bg-slate-700" alt="avatar"/>
                       <span className="font-bold">{p.name} {p.id === myPlayerId ? '(我)' : ''}</span>
                       {p.isHost && <span className="text-xs text-amber-500 border border-amber-500 px-1 rounded mt-1">房主</span>}
@@ -752,6 +788,9 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center justify-center h-full p-8 text-center relative">
             <Button variant="secondary" onClick={leaveRoom} className="absolute top-4 left-4">退出</Button>
             <h2 className="text-2xl font-bold mb-8">你的身份是</h2>
+            <div className="text-xl mb-4 text-slate-400 font-mono bg-slate-800 px-3 py-1 rounded-full inline-block">
+                座位号: {me.id + 1}
+            </div>
             <div className="animate-bounce mb-8 text-8xl">
                 {me.role === Role.WEREWOLF ? '🐺' : 
                  me.role === Role.SEER ? '🔮' : 
@@ -767,188 +806,280 @@ const App: React.FC = () => {
     );
   };
 
-  const renderWolfChat = () => {
-      // Chat is visible to wolves during night
-      // Or maybe always? Usually only night.
-      // For this implementation, let's keep it visible at night for wolves.
+  // Shared Chat Component
+  const renderChat = (type: 'public' | 'wolf') => {
+      const history = type === 'public' ? gameState.publicChatHistory : gameState.wolfChatHistory;
+      const ref = type === 'public' ? publicChatScrollRef : chatScrollRef;
+      const title = type === 'public' ? '💬 讨论频道' : '🐺 狼人频道';
+      
+      const me = gameState.players.find(p => p.id === myPlayerId);
+      const canSpeak = me && (
+          (type === 'wolf' && me.role === Role.WEREWOLF && gameState.phase === Phase.NIGHT) ||
+          (type === 'public' && (me.isAlive || me.hasLastWords))
+      );
+      
+      // Determine placeholder
+      let placeholder = "发言...";
+      if (!me?.isAlive && me?.hasLastWords && type === 'public') placeholder = "请发表遗言 (仅一次)...";
+      if (!canSpeak) placeholder = "无法发言";
+
       return (
-        <div className="bg-slate-900 border-t border-slate-700 p-2 flex flex-col h-48">
-            <div className="text-xs text-slate-500 mb-1">🐺 狼人频道</div>
-            <div className="flex-1 overflow-y-auto space-y-2 mb-2 bg-slate-950/50 p-2 rounded" ref={chatScrollRef}>
-                {gameState.wolfChatHistory.map(msg => (
-                    <div key={msg.id} className="text-xs">
-                        <span className="font-bold text-red-400">{msg.senderName}:</span> <span className="text-slate-300">{msg.text}</span>
+        <div className={`flex flex-col ${type === 'public' ? 'h-48' : 'h-32'} bg-slate-900 border-t border-slate-700 p-2`}>
+            <div className="text-xs text-slate-500 mb-1 flex justify-between">
+                <span>{title}</span>
+                {type === 'public' && me?.hasLastWords && <span className="text-green-400">有遗言机会</span>}
+            </div>
+            <div className="flex-1 overflow-y-auto space-y-2 mb-2 bg-slate-950/50 p-2 rounded" ref={ref}>
+                {history.map(msg => (
+                    <div key={msg.id} className="text-xs break-all">
+                        <span className={`font-bold ${msg.senderName.includes('(遗言)') ? 'text-green-400' : 'text-indigo-300'}`}>
+                            {msg.senderName}:
+                        </span> <span className="text-slate-300">{msg.text}</span>
                     </div>
                 ))}
-                {gameState.wolfChatHistory.length === 0 && <p className="text-xs text-slate-600 italic">暂无消息...</p>}
             </div>
             <div className="flex gap-2">
                 <input 
-                    className="flex-1 bg-slate-800 rounded px-2 py-1 text-sm outline-none border border-slate-700 focus:border-red-500"
-                    value={chatInput}
+                    className="flex-1 bg-slate-800 rounded px-2 py-1 text-sm outline-none border border-slate-700 focus:border-indigo-500 disabled:opacity-50"
+                    value={type === 'public' && appMode === 'GAME' ? chatInput : chatInput} 
+                    // Note: We are using same state 'chatInput' for both. 
+                    // In a real app, might want separate states if both visible at once.
+                    // Here, usually only one is prominent or we just clear on switch.
                     onChange={e => setChatInput(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && sendChatMessage()}
-                    placeholder="与同伴交流..."
+                    onKeyDown={e => e.key === 'Enter' && canSpeak && sendChatMessage(type)}
+                    placeholder={placeholder}
+                    disabled={!canSpeak}
                 />
-                <Button variant="secondary" className="py-1 px-3 text-sm" onClick={sendChatMessage}>发送</Button>
+                <Button 
+                    variant="secondary" 
+                    className="py-1 px-3 text-sm" 
+                    onClick={() => sendChatMessage(type)}
+                    disabled={!canSpeak}
+                >
+                    发送
+                </Button>
             </div>
         </div>
       );
   };
 
   const renderGame = () => {
-     // Determine if I can act
      const me = gameState.players.find(p => p.id === myPlayerId);
-     const canAct = me?.isAlive && (
-         (gameState.nightStep === NightStep.WEREWOLF_ACTION && me.role === Role.WEREWOLF) ||
-         (gameState.nightStep === NightStep.SEER_ACTION && me.role === Role.SEER) ||
-         (gameState.nightStep === NightStep.WITCH_ACTION && me.role === Role.WITCH) ||
-         (gameState.nightStep === NightStep.HUNTER_ACTION && me.role === Role.HUNTER)
-     );
-
-     // Voting Phase Special
-     if (gameState.phase === Phase.VOTING) {
-         return (
-             <div className="p-4 max-w-2xl mx-auto space-y-6 flex flex-col h-full">
-                 <div className="flex justify-between items-center">
-                    <Button variant="secondary" onClick={leaveRoom} className="text-xs">退出</Button>
-                    <h2 className="text-2xl font-bold text-amber-400">投票环节</h2>
-                    <div className="w-10"></div>
-                 </div>
-                 <p className="text-center">{gameState.currentStory}</p>
-                 
-                 <div className="grid grid-cols-2 md:grid-cols-3 gap-3 flex-grow">
-                     {gameState.players.map(p => {
-                         // Calculate who voted for this player
-                         const voters = Object.entries(gameState.currentVotes)
-                            .filter(([_, target]) => target === p.id)
-                            .map(([voterId]) => {
-                                const vId = parseInt(voterId);
-                                return gameState.players.find(pl => pl.id === vId)?.name || 'Unknown';
-                            });
-                         
-                         return (
-                            <div key={p.id} className="relative">
-                                <PlayerCard 
-                                    player={p} 
-                                    selectable={p.isAlive && me?.isAlive} // Only alive can vote
-                                    selected={myPlayerId !== null && gameState.currentVotes[myPlayerId] === p.id}
-                                    onSelect={() => me?.isAlive && sendAction('VOTE', { targetId: p.id })}
-                                    isMe={p.id === myPlayerId}
-                                />
-                                {voters.length > 0 && (
-                                    <div className="absolute -bottom-2 -right-2 bg-amber-600 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center font-bold border-2 border-slate-900 z-10">
-                                        {voters.length}
-                                    </div>
-                                )}
-                            </div>
-                         );
-                     })}
-                 </div>
-                 
-                 {isHost && (
-                     <div className="bg-slate-800 p-4 rounded mt-4">
-                         <Button fullWidth className="mt-2" onClick={submitVotes}>公布结果</Button>
-                     </div>
-                 )}
-             </div>
-         );
-     }
+     const isNight = gameState.phase === Phase.NIGHT;
+     
+     // Ability Checks
+     const isWolfTurn = isNight && gameState.nightStep === NightStep.WEREWOLF_ACTION && me?.role === Role.WEREWOLF && me.isAlive;
+     const isSeerTurn = isNight && gameState.nightStep === NightStep.SEER_ACTION && me?.role === Role.SEER && me.isAlive;
+     const isWitchTurn = isNight && gameState.nightStep === NightStep.WITCH_ACTION && me?.role === Role.WITCH && me.isAlive;
+     const isHunterTurn = (isNight || gameState.phase === Phase.NIGHT) && gameState.nightStep === NightStep.HUNTER_ACTION && me?.role === Role.HUNTER; // Hunter acts when dead in this phase
+     const isVoting = gameState.phase === Phase.VOTING && me?.isAlive;
 
      return (
-         <div className="flex flex-col h-full max-w-4xl mx-auto p-4 space-y-6">
+         <div className="flex flex-col h-full max-w-4xl mx-auto p-4 space-y-4">
             <div className="flex justify-between items-center relative">
                  <Button variant="secondary" onClick={leaveRoom} className="text-xs absolute left-0">退出</Button>
                  <div className="w-full text-center">
                     <div className="inline-block bg-indigo-900/50 px-3 py-1 rounded-full text-xs font-bold mb-2">
-                        第 {gameState.round} 天 - {gameState.phase === Phase.NIGHT ? "黑夜" : "白天"}
+                        第 {gameState.round} 天 - {isNight ? "黑夜" : "白天"}
                     </div>
-                    <h2 className="text-xl font-bold text-slate-100 px-12">{gameState.currentStory}</h2>
+                    <h2 className="text-xl font-bold text-slate-100 px-12 line-clamp-2">{gameState.currentStory}</h2>
                  </div>
              </div>
              
              {/* Main Grid */}
-             <div className="grid grid-cols-3 md:grid-cols-4 gap-3 flex-grow overflow-y-auto pb-4">
+             <div className="grid grid-cols-3 md:grid-cols-4 gap-3 flex-grow overflow-y-auto pb-4 content-start">
                  {gameState.players.map(p => (
                      <PlayerCard
                         key={p.id}
                         player={p}
                         isMe={p.id === myPlayerId}
-                        // Reveal role ONLY if it's me OR I am a wolf and they are a wolf
                         revealed={
                             p.id === myPlayerId || 
-                            (!p.isAlive) || // Reveal dead
+                            (!p.isAlive) || 
                             (me?.role === Role.WEREWOLF && p.role === Role.WEREWOLF)
                         }
-                        selectable={canAct && p.isAlive}
                         selected={
                             gameState.wolvesTargetId === p.id ||
-                            gameState.seerCheckId === p.id ||
                             gameState.witchAction.poisonTargetId === p.id ||
                             gameState.hunterTargetId === p.id
                         }
-                        onSelect={() => {
-                            if (!canAct) return;
-                            if (gameState.nightStep === NightStep.WEREWOLF_ACTION) handleWolfSelect(p.id);
-                            // Seer can check only 1, so overwriting is fine
-                            if (gameState.nightStep === NightStep.SEER_ACTION) handleSeerCheck(p.id);
-                            // Witch poisoning
-                            if (gameState.nightStep === NightStep.WITCH_ACTION && !gameState.witchPoisonUsed) {
-                                handleWitchAction('poison', p.id);
-                            }
-                            if (gameState.nightStep === NightStep.HUNTER_ACTION) handleHunterShoot(p.id);
-                        }}
+                        // No onClick logic on cards anymore
                      />
                  ))}
              </div>
 
-             {/* Action Bar */}
-             <div className="mt-auto">
-                 {/* Seer Result */}
-                 {me?.role === Role.SEER && gameState.seerCheckId !== null && (
-                     <div className="bg-indigo-900/30 p-3 rounded text-center mb-4 border border-indigo-500 animate-pulse">
-                         查验结果: <span className="font-bold text-xl ml-2">{gameState.players[gameState.seerCheckId].role === Role.WEREWOLF ? "🐺 狼人" : "✅ 好人"}</span>
+             {/* Voting Results Overlay (if voting phase over or showing votes) */}
+             {isVoting && (
+                 <div className="text-center text-xs text-amber-500">
+                     正在投票... 票数将在结果公布时揭晓
+                 </div>
+             )}
+
+             {/* --- Action Control Panel --- */}
+             <div className="bg-slate-800 rounded-xl p-4 shadow-lg border border-slate-700">
+                 
+                 {/* 1. Wolf Action */}
+                 {isWolfTurn && (
+                     <div className="flex gap-2 items-center">
+                         <span className="text-red-400 font-bold whitespace-nowrap">🐺 袭击目标:</span>
+                         <input 
+                            type="number" 
+                            className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1"
+                            placeholder="#"
+                            value={targetInput}
+                            onChange={e => setTargetInput(e.target.value)}
+                         />
+                         <Button onClick={() => handleSeatInput(handleWolfSelect)} className="text-sm">确认袭击</Button>
                      </div>
                  )}
-                 {/* Witch Controls */}
-                 {me?.role === Role.WITCH && gameState.nightStep === NightStep.WITCH_ACTION && (
-                     <div className="flex gap-2 mb-4">
-                         <Button 
-                             fullWidth 
-                             variant={gameState.witchAction.save ? "primary" : "secondary"}
-                             onClick={() => handleWitchAction('save')}
-                             disabled={gameState.witchSaveUsed || !gameState.wolvesTargetId}
-                         >
-                             使用解药 ({gameState.wolvesTargetId ? "有人被杀" : "平安"})
-                         </Button>
-                         <div className="flex items-center text-xs text-slate-400 px-2">
-                             {gameState.witchPoisonUsed ? "毒药已用" : "请点击玩家头像使用毒药"}
+
+                 {/* 2. Seer Action */}
+                 {isSeerTurn && (
+                    <div className="space-y-2">
+                         <div className="flex gap-2 items-center">
+                             <span className="text-indigo-400 font-bold whitespace-nowrap">🔮 查验目标:</span>
+                             <input 
+                                type="number" 
+                                className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1"
+                                placeholder="#"
+                                value={targetInput}
+                                onChange={e => setTargetInput(e.target.value)}
+                                disabled={gameState.seerCheckId !== null} // Lock after check
+                             />
+                             <Button 
+                                onClick={() => handleSeatInput(handleSeerCheck)} 
+                                className="text-sm"
+                                disabled={gameState.seerCheckId !== null}
+                             >
+                                 查验
+                             </Button>
+                         </div>
+                         {/* Result Display */}
+                         {gameState.seerCheckId !== null && (
+                            <div className="bg-indigo-900/50 p-2 rounded text-center border border-indigo-500">
+                                玩家 <span className="font-bold text-lg mx-1">{gameState.seerCheckId + 1}</span> 是: 
+                                <span className="font-bold text-xl ml-2 text-white">
+                                    {gameState.players[gameState.seerCheckId].role === Role.WEREWOLF ? "🐺 狼人" : "✅ 好人"}
+                                </span>
+                            </div>
+                         )}
+                    </div>
+                 )}
+
+                 {/* 3. Witch Action */}
+                 {isWitchTurn && (
+                     <div className="space-y-3">
+                         {/* Save Info */}
+                         <div className="flex justify-between items-center bg-slate-700/50 p-2 rounded">
+                             <span className="text-sm text-slate-300">昨晚死亡:</span>
+                             {/* Show info only if save is available or used now */}
+                             {!gameState.witchSaveUsed || gameState.witchAction.save ? (
+                                 <span className="font-bold text-red-400">
+                                     {gameState.wolvesTargetId !== null 
+                                        ? `${gameState.wolvesTargetId + 1}号 (${gameState.players[gameState.wolvesTargetId].name})` 
+                                        : "无人死亡"}
+                                 </span>
+                             ) : (
+                                 <span className="text-xs text-slate-500">解药已用，无法查看</span>
+                             )}
+                         </div>
+
+                         <div className="flex gap-2">
+                             <Button 
+                                 fullWidth 
+                                 variant={gameState.witchAction.save ? "primary" : "secondary"}
+                                 onClick={() => handleWitchAction('save')}
+                                 disabled={gameState.witchSaveUsed || gameState.wolvesTargetId === null}
+                                 className="text-sm"
+                             >
+                                 {gameState.witchAction.save ? "取消使用解药" : "使用解药"}
+                             </Button>
+                         </div>
+
+                         <div className="flex gap-2 items-center border-t border-slate-700 pt-2">
+                             <span className="text-purple-400 font-bold whitespace-nowrap text-sm">毒药目标:</span>
+                             <input 
+                                type="number" 
+                                className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1"
+                                placeholder="#"
+                                value={targetInput}
+                                onChange={e => setTargetInput(e.target.value)}
+                                disabled={gameState.witchPoisonUsed}
+                             />
+                             <Button 
+                                onClick={() => handleSeatInput((id) => handleWitchAction('poison', id))} 
+                                disabled={gameState.witchPoisonUsed}
+                                className="text-sm"
+                             >
+                                 泼毒
+                             </Button>
                          </div>
                      </div>
                  )}
 
-                 {/* Wolf Chat - Only visible to wolves at night (or always if prefered, here only night) */}
-                 {me?.role === Role.WEREWOLF && gameState.phase === Phase.NIGHT && renderWolfChat()}
+                 {/* 4. Hunter Action */}
+                 {isHunterTurn && (
+                     <div className="flex gap-2 items-center animate-pulse">
+                         <span className="text-orange-400 font-bold whitespace-nowrap">🔫 带走一人:</span>
+                         <input 
+                            type="number" 
+                            className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1"
+                            placeholder="#"
+                            value={targetInput}
+                            onChange={e => setTargetInput(e.target.value)}
+                         />
+                         <Button onClick={() => handleSeatInput(handleHunterShoot)} variant="danger" className="text-sm">开枪</Button>
+                     </div>
+                 )}
 
-                 {/* Phase Controls (Host Only usually, but actions are sent by clients) */}
-                 {isHost && gameState.phase === Phase.NIGHT && gameState.nightStep !== NightStep.NONE && (
+                 {/* 5. Voting Action */}
+                 {isVoting && (
+                     <div className="flex gap-2 items-center justify-center">
+                         <span className="text-amber-400 font-bold whitespace-nowrap">🗳️ 投票给:</span>
+                         <input 
+                            type="number" 
+                            className="w-16 bg-slate-900 border border-slate-600 rounded px-2 py-1"
+                            placeholder="#"
+                            value={targetInput}
+                            onChange={e => setTargetInput(e.target.value)}
+                         />
+                         <Button onClick={() => handleSeatInput((id) => sendAction('VOTE', { targetId: id }))} className="text-sm">确认投票</Button>
+                     </div>
+                 )}
+
+                 {/* Host Controls */}
+                 {isHost && isNight && gameState.nightStep !== NightStep.NONE && (
                      <Button fullWidth onClick={() => {
                         if (gameState.nightStep === NightStep.WEREWOLF_ACTION) confirmWolfAction();
                         else if (gameState.nightStep === NightStep.SEER_ACTION) confirmSeerAction();
                         else if (gameState.nightStep === NightStep.WITCH_ACTION) confirmWitchAction();
                         else if (gameState.nightStep === NightStep.HUNTER_ACTION) confirmHunterAction();
-                     }} className="mt-2">
+                     }} className="mt-4 border-t border-slate-600 pt-2">
                          法官：确认并继续
                      </Button>
                  )}
-                 
                  {isHost && gameState.phase === Phase.DAY_TRANSITION && (
                      <Button fullWidth onClick={startDiscussion} className="mt-2">开始讨论</Button>
                  )}
                  {isHost && gameState.phase === Phase.DAY_DISCUSSION && (
                      <Button fullWidth onClick={startVoting} className="mt-2">发起投票</Button>
                  )}
+                 {isHost && gameState.phase === Phase.VOTING && (
+                     <Button fullWidth onClick={submitVotes} className="mt-4">公布投票结果</Button>
+                 )}
+
+                 {/* Fallback Text for non-active players */}
+                 {!isWolfTurn && !isSeerTurn && !isWitchTurn && !isHunterTurn && !isVoting && !isHost && (
+                     <div className="text-center text-slate-500 text-sm italic">
+                         等待其他玩家行动...
+                     </div>
+                 )}
              </div>
+
+             {/* Chat Section */}
+             {isNight && me?.role === Role.WEREWOLF && renderChat('wolf')}
+             {!isNight && renderChat('public')}
+
          </div>
      );
   };
